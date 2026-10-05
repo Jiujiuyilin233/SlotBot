@@ -25,6 +25,7 @@ digits/
 配置方案/
 diagnostics/
 其他截图/
+tests/seven_screen_*.png
 
 # Desktop/editor files
 .DS_Store

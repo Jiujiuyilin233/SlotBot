@@ -28,6 +28,25 @@ class FakeScreen:
     def grab(self): return self.grab_rect()
 
 class Regression(unittest.TestCase):
+    def setUp(self):
+        # Full game screenshots are private, optional fixtures. The public
+        # package keeps cropped digits/buttons and runs all other regressions.
+        private_scene_tests = {
+            'test_full_real_screens_find_credit_and_chance',
+            'test_truncated_digit_never_reads_as_one',
+            'test_digit_fit_accepts_real_selections',
+            'test_live_readout_refuses_truncated_zero',
+            'test_scene_shift_separates_animation_from_rotation',
+            'test_digit_width_uses_median_not_span',
+            'test_drift_reminder_never_blocks',
+            'test_view_drift_not_reported_for_live_scene',
+            'test_view_drift_is_reported',
+            'test_auto_find_button_uses_full_screen_with_window_hidden',
+        }
+        if self._testMethodName in private_scene_tests and not all(
+                (ROOT / f'tests/seven_screen_{n}.png').is_file() for n in (1, 2, 3)):
+            self.skipTest('Optional full-scene fixtures are excluded from the public source package.')
+
     @classmethod
     def setUpClass(cls):
         cls.zero=s.load_image(str(ROOT/'tests/credit_zero_real.png'))
