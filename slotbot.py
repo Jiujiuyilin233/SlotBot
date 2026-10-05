@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-LuraSlot 图像识别自动化助手
+SlotBot 图像识别自动化助手
 ============================================================
 和按键精灵脚本功能一致（投币 -> 下注 -> 拉杆 -> 三个按钮 -> 清币 -> 循环），
 支持固定坐标和带搜索范围的彩色模板定位；Credit 使用保守的七段解码。
@@ -29,14 +29,27 @@ import cv2
 import numpy as np
 
 # ---------------- DPI 感知：让 tk / 截图 / 鼠标统一用物理像素 ----------------
-# 打包成 exe 时由 LuraSlot.manifest 声明 PerMonitorV2（更早、更可靠）；
+# 打包成 exe 时由 SlotBot.manifest 声明 PerMonitorV2（更早、更可靠）；
 # 这里是为源码直接运行时的兜底，两者保持一致。
 DPI_AWARENESS = 0  # 0=unaware 1=system 2=per-monitor 3=per-monitor-v2
+
+def _query_dpi_awareness():
+    """查询当前线程的真实 DPI 感知级别。
+
+    注意不能把常量 -4 直接传给 GetAwarenessFromDpiAwarenessContext——那查的是
+    传入的 context 句柄代表什么（-4 永远返回 per-monitor-v2），不是进程状态。
+    必须先取 GetThreadDpiAwarenessContext 再查它。
+    """
+    u32 = ctypes.windll.user32
+    u32.GetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+    u32.GetAwarenessFromDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+    u32.GetAwarenessFromDpiAwarenessContext.restype = ctypes.c_int
+    return u32.GetAwarenessFromDpiAwarenessContext(u32.GetThreadDpiAwarenessContext())
+
 try:
-    DPI_AWARENESS = ctypes.windll.user32.GetAwarenessFromDpiAwarenessContext(
-        ctypes.c_void_p(-4))
+    DPI_AWARENESS = _query_dpi_awareness()
 except Exception:
-    pass
+    DPI_AWARENESS = 0
 if not DPI_AWARENESS:
     try:  # Win10 1703+：PerMonitorV2，坐标虚拟化问题最小
         ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
@@ -49,8 +62,7 @@ if not DPI_AWARENESS:
             except Exception:
                 pass
     try:
-        DPI_AWARENESS = ctypes.windll.user32.GetAwarenessFromDpiAwarenessContext(
-            ctypes.c_void_p(-4))
+        DPI_AWARENESS = _query_dpi_awareness()
     except Exception:
         DPI_AWARENESS = 0
 # manifest 已经声明过感知时，SetProcessDpiAwarenessContext 会失败（awareness 已定），
@@ -273,7 +285,7 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 版本与署名：底栏、窗口标题、--diag、使用说明、README 都从这里取
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_AUTHORS = "Jiujiuyilin_233 / 绝世好裤裆"
 # 允许用环境变量指定数据目录（自检/测试时隔离，避免覆盖用户真实配置）
 DATA_DIR = os.environ.get("SLOTBOT_DATA_DIR") or APP_DIR
@@ -410,38 +422,13 @@ _AUTO_STATE = {"last": 0.0}
 
 
 def auto_collect_credit(crop, value, cfg=None, log=None):
-    """自我训练采集：把稳定可信的读数存成新样本，喂给模板库。
+    """运行中可信读数 → 存为「待审核数字样本」。
 
-    门槛（缺一不存——存错一张等于污染模板库）：
-    ① 配置开了 auto_learn（默认开）；
-    ② 值是纯数字（调用方还要保证它是「连续三帧一致」的稳定读数）；
-    ③ 距上次自动采集 ≥ AUTO_COOLDOWN 秒，且该数值存量 < AUTO_MAX_PER_VALUE。
+    预测值绝不直接训练识别库（存错一张等于污染模板库），必须经人工
+    审核确认真值后才进入正式库；开关是 cfg 里的 collect_pending。
     """
-    if not AUTO_LEARN_ALLOWED:
-        return None
-    if cfg is not None and not cfg.get("auto_learn", True):
-        return None
-    if crop is None or getattr(crop, "size", 0) == 0 or not str(value).isdigit():
-        return None
-    now = time.time()
-    if now - _AUTO_STATE["last"] < AUTO_COOLDOWN:
-        return None
-    try:
-        os.makedirs(DIGITS_DIR, exist_ok=True)
-        prefix = f"auto{value}_"
-        count = sum(1 for fn in os.listdir(DIGITS_DIR) if fn.startswith(prefix))
-        if count >= AUTO_MAX_PER_VALUE:
-            return None
-        name = prefix + time.strftime("%Y%m%d_%H%M%S") + ".png"
-        path = os.path.join(DIGITS_DIR, name)
-        if not cv2.imwrite(path, crop):
-            return None
-    except Exception:  # noqa: BLE001  采集失败绝不能影响运行
-        return None
-    _AUTO_STATE["last"] = now
-    if log:
-        log(f"[自训练] 已自动存样本 {name}（模板库同步重建）")
-    return path
+    pending_sample(sys.modules[__name__], crop, value, cfg, log)
+    return None
 
 
 # ---------------- 按钮多模板（部件多视角样本）----------------
@@ -528,7 +515,7 @@ def _save_variant(dst_key_dir, src_name, img):
     while os.path.exists(path):
         path = os.path.join(dst_key_dir, f"{stem}-{i}.png")
         i += 1
-    return path if cv2.imwrite(path, img) else None
+    return path if save_image(path, img) else None
 
 
 def import_button_samples(src, dst=None, log=None):
@@ -757,28 +744,6 @@ class LegacyAutoCollector(threading.Thread):
 
     def _center(self, rect):
         return (rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0)
-
-    def read_at(self, rect):
-        """在给定区域连读三帧，三帧一致才认。"""
-        if not rect or self.screen is None:
-            return None
-        last, run = None, 0
-        deadline = time.monotonic() + max(.5, float(self.params.get("read_timeout", 1.2)))
-        while time.monotonic() < deadline and not self.stop_flag.is_set():
-            try:
-                crop = self.screen.grab_rect(*rect)
-            except Exception:
-                return None
-            val, _info = decode_led_fused(crop, get_digit_bank())
-            if val and str(val).isdigit():
-                run = run + 1 if val == last else 1
-                last = val
-                if run >= 3:
-                    return crop, val
-            else:
-                run, last = 0, None
-            self._wait(.08)
-        return None
 
     def save(self, crop, truth, tag):
         """按真值存样本；同名不覆盖，往后编号。"""
@@ -1265,82 +1230,6 @@ class LegacyEngine(threading.Thread):
         if self.stop_flag.wait(max(0, seconds)):
             raise InterruptedError('已请求停止')
 
-    def request_stop(self):
-        self.stop_flag.set()
-
-    def start_watchdog(self):
-        """独立线程急停监测：F12/End/Pause 轮询、鼠标甩到左上角、超时自动停。
-        不依赖全局键盘钩子，钩子失效时照样能停。"""
-        def _watch():
-            t0 = time.time()
-            max_min = float(self.cfg.get("max_minutes", 0) or 0)
-            corner = int(self.cfg.get("corner_stop_px", 40))
-            # 急停键：默认 F12 / End，可在参数页自定义。
-            # Pause 会和"拖动窗口标题栏"冲突，除非用户自己加，否则不启用。
-            keys = stop_key_entries(self.cfg)
-            need = max(2, int(self.cfg.get("force_quit_presses", 2) or 2))
-            pressed = {vk: False for vk, _ in keys}
-
-            def poll_taps():
-                """返回这一轮里**新按下**（按下前是松开的）的键，避免按住不放被重复计数。"""
-                hits = []
-                for vk, name in keys:
-                    down = key_pressed(vk)
-                    if down and not pressed[vk]:
-                        hits.append((vk, name))
-                    pressed[vk] = down
-                return hits
-
-            taps = 0
-            last = None
-            while not self.stop_flag.is_set():
-                hits = poll_taps()
-                if hits:
-                    now = time.time()
-                    # 间隔超过 2 秒算新的一轮连按
-                    taps = taps + len(hits) if (last and now - last <= 2.0) else len(hits)
-                    last = now
-                    vk, name = hits[0]
-                    if taps >= need:
-                        self.log(f"[急停] 连按 {name} {taps} 次，直接结束进程")
-                        self.stop_flag.set()
-                        try:
-                            os._exit(0)
-                        except Exception:
-                            pass
-                        return
-                    self.log(f"[急停] 检测到 {name} 按下，正在停止…"
-                             f"（再按 {need - taps} 次可强制结束进程）")
-                    self.stop_flag.set()
-                    break
-                x, y = cursor_pos()
-                if 0 <= x <= corner and 0 <= y <= corner:
-                    self.log(f"[急停] 鼠标甩到左上角（{x},{y}），立即停止")
-                    self.stop_flag.set()
-                    return
-                if max_min > 0 and (time.time() - t0) > max_min * 60:
-                    self.log(f"[急停] 已连续运行 {max_min:.0f} 分钟，自动停止")
-                    self.stop_flag.set()
-                    return
-                self.stop_flag.wait(0.08)
-            # 已经请求停止：再守一小会儿，引擎如果卡住，连按热键可以直接结束进程
-            deadline = time.time() + 5.0
-            while time.time() < deadline and self.is_alive():
-                hits = poll_taps()
-                if hits:
-                    now = time.time()
-                    taps = taps + len(hits) if (last and now - last <= 2.0) else len(hits)
-                    last = now
-                    if taps >= need:
-                        self.log(f"[急停] 连按 {hits[0][1]} 共 {taps} 次，直接结束进程")
-                        try:
-                            os._exit(0)
-                        except Exception:
-                            pass
-                self.stop_flag.wait(0.08)
-
-        threading.Thread(target=_watch, daemon=True).start()
-
     def _scales(self):
         c = self.cfg
         if not c["multi_scale"]:
@@ -1449,33 +1338,6 @@ class LegacyEngine(threading.Thread):
         return not self.stop_flag.is_set()
 
     # ---------- 业务动作 ----------
-    def insert_coins(self):
-        n = int(self.cfg["coin_count"])
-        first = self.locate("coin")
-        if first is None:
-            return False
-        coord_mode = self.cfg.get("locate_mode", "coord") == "coord"
-        self.log(f"投币开始：{n} 个（0.1 秒/个，坐标 {first[0]},{first[1]}）")
-        x, y = first
-        pdi.moveTo(x, y)
-        self.pause(self.cfg["move_delay"] / 1000.0)
-        for i in range(n):
-            if self.stop_flag.is_set():
-                return False
-            if (not coord_mode) and i > 0 and i % 10 == 0:
-                # 图像识别模式：每 10 个重新确认一次位置，防止机器动画/视角漂移
-                pos = self.locate("coin", retries=3)
-                if pos:
-                    x, y = pos
-                    pdi.moveTo(x, y)
-                else:
-                    return False
-            pdi.click()
-            self.pause(self.cfg["coin_delay"] / 1000.0)
-        self.log("投币完成，等待机器吃币…")
-        self.pause(self.cfg["last_coin_wait"] / 1000.0)
-        return True
-
     def _watch_region(self):
         """返回监测区域画面（未设定返回 None）"""
         r = self.cfg.get("watch_rect")
@@ -1737,184 +1599,6 @@ class LegacyEngine(threading.Thread):
                 )
                 return False
         return True
-
-    def spin(self, watch_change=False):
-        """先确认可下注余额，再确认精确扣币，之后拉杆和停止转轮。
-
-        **一旦 MaxBet/Bet 已经点下去，这一注就必须做完**（拉杆 + 三个停止按钮）。
-        中途因为"读数没确认到扣币"就退出，等于钱已经押上却把转轮晾在那儿，
-        那一注直接白押。所以 bet_committed 之后任何失败都继续把动作做完。
-
-        watch_change 时返回 (动作成功, 本次是否执行抽奖)；不足一注不执行动作。
-        """
-        step = self.cfg["step_delay"] / 1000.0
-        self.bet_committed = False
-        credit,info=self.stable_credit_value()
-        if credit is None:
-            self.log(f'[停止] 下注前不能确认 Credit：{info}')
-            return (False,True) if watch_change else False
-        bet=int(self.cfg['bet_count'])
-        if credit < bet:
-            self.log(f'[补币] Credit {credit} 小于下注 {bet}，与 0 同样结束本轮，下一轮正常投币')
-            return (True,False) if watch_change else False
-
-        self.pause(step)
-        if not self.place_confirmed_bet(credit) and not self.bet_committed:
-            # 确认失败但**没点出去**（点都没发出去），可以安全放弃
-            return (False,True) if watch_change else False
-        if self.bet_committed and not self.confirmed:
-            self.log(
-                '[下注] 没能从画面确认扣币，但 MaxBet/Bet 已经点下去了——'
-                '这一注钱已经押上，继续把拉杆和三个停止按钮做完，不留半截'
-            )
-
-        # 拉杆（已下注就必须拉）
-        self.pause(step)
-        if not self.drag_template("lever", self.cfg["pull_px"]):
-            self.log('[停止] 拉杆失败。若这一注已下注，转轮可能停在中间，请手动处理')
-            return (False, True) if watch_change else False
-
-        # 三个按钮（已下注就必须按完）
-        for key in ("btn1", "btn2", "btn3"):
-            self.pause(step)
-            if not self.click_template(key):
-                self.log(f'[停止] {TPL_LABEL[key]} 失败，本局动作未做完整')
-                return (False, True) if watch_change else False
-        # 扣币没被确认过就只记日志、不计入完成次数：
-        # 动作虽然做了，但这一注到底成没成不确定，不能当成正常一局。
-        if self.confirmed:
-            self.spins_done += 1
-        else:
-            self.log('[下注] 本局动作已做完，但扣币未能确认，不计入完成次数')
-        if watch_change:
-            return True, True
-        return True
-
-    def run(self):
-        c = self.cfg
-        self.log("=== 开始运行（F12 停止）===")
-        if pdi is None:
-            self.log("[错误] 未安装 pydirectinput，无法模拟鼠标键盘")
-            return
-
-        holder = None
-        try:
-            self.start_watchdog()
-            # 先把游戏窗口切到前台，再持续续按 Tab
-            kw = str(c.get("game_window", "") or "")
-            wins = list_windows(kw) if kw else []
-            if wins:
-                ok = activate_window(wins[0][0])
-                self.log(f"已激活游戏窗口：{wins[0][1]}（{'成功' if ok else '可能未成功，请手动点一下游戏'}）")
-                self.pause(0.4)
-            elif kw:
-                self.log(f"[提示] 没找到标题含「{kw}」的窗口，Tab 需要游戏在前台才能生效")
-
-            if c["hold_tab"]:
-                holder = TabHolder(interval=max(0.1, float(c.get("tab_repeat", 400)) / 1000.0))
-                holder.start()
-                self.log(f"已开始按住 Tab（每 {c.get('tab_repeat', 400)} 毫秒续按一次，确保游戏收到）")
-                self.pause(0.5)
-
-            # 确认游戏真的拿到焦点，否则 Tab 无法生效
-            if kw:
-                got = False
-                for _ in range(6):
-                    if self.stop_flag.is_set():
-                        return
-                    cur = foreground_title()
-                    if kw.lower() in cur.lower():
-                        self.log(f"游戏窗口已在前台：{cur}")
-                        got = True
-                        break
-                    if wins:
-                        activate_window(wins[0][0])
-                    self.pause(0.5)
-                if not got:
-                    self.log(f"[停止] 当前前台是「{foreground_title() or '未知窗口'}」，游戏没拿到焦点，请激活游戏后重新启动")
-                    return
-
-            if c.get('credit_rect') or c.get('watch_rect'):
-                known, info = self.stable_credit_value()
-                if known is None:
-                    self.log('[停止] 运行前 Credit 校验失败：'+info)
-                    return
-            else:
-                self.log('[停止] 未设 Credit 或备用数字区，无法确认下注')
-                return
-
-            rounds = int(c["rounds"])
-            r = 0
-            while not self.stop_flag.is_set():
-                r += 1
-                self.log(f"------ 第 {r} 轮 ------")
-
-                self.state = "投币"
-                if not self.insert_coins():
-                    break
-                self.coins_used += int(c["coin_count"])
-
-                ok = True
-                needs_coins = False
-                self.state = "抽奖"
-                target = int(c["draw_count"])
-                for i in range(target):
-                    if self.stop_flag.is_set():
-                        ok = False
-                        break
-                    res, has_coins = self.spin(watch_change=True)
-                    if res and not has_coins:
-                        needs_coins = True
-                        self.log('Credit 不足一注，结束本轮正常抽奖并进入下一轮投币')
-                        break
-                    if not res:
-                        ok = False
-                        break
-                    self.log(f"抽奖 {i + 1}/{target} 完成")
-
-                if not ok:
-                    break
-
-                # 空转清币
-                burn = int(c["burn_count"])
-                if burn > 0 and not needs_coins:
-                    self.state = "空转清币"
-                    self.log(f"空转清币开始（最多 {burn} 次）")
-                    for i in range(burn):
-                        if self.stop_flag.is_set():
-                            break
-                        res, changed = self.spin(watch_change=True)
-                        if not res:
-                            ok = False
-                            break
-                        if not changed:
-                            self.log('Credit 不足一注，结束清币，下一轮正常投币')
-                            break
-                        self.log(f"空转 {i + 1}/{burn} 完成")
-
-                if not ok:
-                    self.log("[中断] 有动作失败，已停止。请检查模板是否需要重新录制 / 阈值是否过高")
-                    break
-
-                self.rounds_done = r
-                if rounds and r >= rounds:
-                    self.log("已完成设定的轮数，正常结束")
-                    break
-        except InterruptedError:
-            self.log('[停止] 已中断等待和后续动作')
-        except Exception as e:  # noqa: BLE001
-            self.log(f"[异常] {type(e).__name__}: {e}")
-        finally:
-            if holder is not None:
-                holder.release()
-                self.log("已松开 Tab")
-            self.state = "idle"
-            mins = max(0.0, (time.time() - self.started_at) / 60.0)
-            self.log(
-                f"=== 已停止 === 本次运行：{self.rounds_done} 轮 · 抽奖 {self.spins_done} 次 · "
-                f"确认下注 {self.bets_confirmed} 注 · 用币 {self.coins_used} 枚 · 用时 {mins:.1f} 分钟"
-            )
-
 
 # =========================================================================
 # 框选工具
@@ -2375,7 +2059,8 @@ class CreditMonitor(tk.Toplevel):
 class ModernApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f"LuraSlot 自动化助手 v{APP_VERSION}")
+        setup_theme(self)  # 统一主题：卡片、强调按钮、页签样式；不调用就是默认灰白 ttk
+        self.title(f"SlotBot 自动化助手 v{APP_VERSION}")
         self.cfg = dict(DEFAULT_CFG)
         self.tpls = {}
         self.tpl_variants = {}  # {key: [多视角模板, ...]}
@@ -2554,14 +2239,6 @@ class ModernApp(tk.Tk):
             win.after(1000, _refresh)
 
         _refresh()
-
-    def _parts_summary(self):
-        """每个部件有多少张模板（主模板 + 多视角），一行汇总。"""
-        parts = []
-        for key, label in TEMPLATES:
-            n = len(load_template_variants(key))
-            parts.append(f"{label} {n}")
-        return "部件模板：" + "　".join(parts)
 
     def update_parts_label(self):
         """每个部件有多少张模板（主模板 + 多视角）。"""
@@ -2777,27 +2454,6 @@ class ModernApp(tk.Tk):
 
 
     # ---------- 停止热键（自定义）----------
-    def refresh_stop_keys(self):
-        """把当前热键画成一排带 ✕ 的标签。"""
-        for w in self.hk_frame.winfo_children():
-            w.destroy()
-        entries = stop_key_entries(self.cfg)
-        for _vk, name in entries:
-            chip = ttk.Frame(self.hk_frame, style="Card.TFrame")
-            chip.pack(side="left", padx=(0, 6))
-            ttk.Label(chip, text=name, style="Card.TLabel").pack(side="left")
-            ttk.Button(chip, text="X", width=2, style="Ghost.TButton",
-                       command=lambda n=name: self.remove_stop_key(n)).pack(
-                side="left", padx=(2, 0))
-        need = max(2, int(self.cfg.get("force_quit_presses", 2) or 2))
-        try:
-            self.lbl_hk.configure(
-                text=f"当前：{' / '.join(n for _, n in entries)}　·　"
-                     f"连按 {need} 次可直接结束进程（普通停止卡住时用）　·　"
-                     f"改动在下次开始运行时生效")
-        except tk.TclError:
-            pass
-
     def _write_stop_keys(self, names, note):
         self.cfg["stop_keys"] = names
         self.cfg["extra_stop_key"] = ""   # 旧字段作废，避免重复
@@ -2952,12 +2608,6 @@ class ModernApp(tk.Tk):
                 continue
         return stats
 
-    def rebuild_digit_bank(self):
-        """手动重建模板库（用户新拷了一批样本进来时用）。"""
-        bank = get_digit_bank(force=True)
-        self.update_bank_label()
-        self.log(f"[自训练] 模板库已重建：{bank_summary(bank)}")
-
     def open_sample_dir(self):
         """打开样本目录，方便用户把自己截的图拷进去（41.png / 41-2.png）。
 
@@ -3017,38 +2667,6 @@ class ModernApp(tk.Tk):
             missing.append("还没框选 Credit 数字区")
         return missing
 
-    def _refresh_run_buttons(self):
-        """按当前配置和运行状态更新「开始运行 / 停止」按钮。
-
-        之前这里把开始按钮写死成 disabled，只有跑完一轮才恢复，
-        导致首次打开永远是灰的、点不动。现在状态由配置推导：
-        缺什么就显示什么提示，缺得多时才真的禁用。
-        """
-        running = bool(self.engine and self.engine.is_alive())
-        if self.collector and self.collector.is_alive():
-            # 采集也在动鼠标：开始必须禁用，但「停止」必须可用——
-            # 曾经连停止都灰着，采集时就只剩向导里一个小按钮能停
-            self.btn_start.config(state="disabled")
-            self.btn_stop.config(state="normal")
-            self.lbl_ready.config(text="自动采集进行中（停止按钮/急停键都可停）", foreground=WARN)
-            return
-        if running:
-            self.btn_start.config(state="disabled")
-            self.btn_stop.config(state="normal")
-            self.lbl_ready.config(text="运行中…", foreground=ACCENT)
-            return
-        self.btn_stop.config(state="disabled")
-        missing = self._missing_requirements()
-        if missing:
-            # 还没配好时不禁用按钮：让用户点了能立刻看到缺什么，
-            # 灰着不给点反而让人以为是程序坏了。
-            self.btn_start.config(state="normal")
-            self.lbl_ready.config(text="；".join(missing), foreground=WARN)
-        else:
-            self.btn_start.config(state="normal")
-            self.lbl_ready.config(text="配置就绪，可以开始（建议先跑一次自检）", foreground=OK)
-
-
 
     def _clear_log(self):
         self.txt.configure(state="normal")
@@ -3068,62 +2686,7 @@ class ModernApp(tk.Tk):
         ok = activate_window(wins[0][0])
         self.log(f"[窗口] 激活「{wins[0][1]}」：{'成功' if ok else '失败，请手动点一下游戏'}")
 
-    def test_tab(self):
-        kw = self.vars.get("game_window")
-        keyword = kw.get().strip() if kw else "VRChat"
-        wins = list_windows(keyword)
-        if wins:
-            activate_window(wins[0][0])
-            self.log(f"[测试] 已激活游戏窗口「{wins[0][1]}」")
-        else:
-            self.log(f"[测试] 没找到「{keyword}」窗口，3 秒后开始按 Tab（请手动点一下游戏窗口）")
-        self.iconify()
-
-        def _hold():
-            time.sleep(1.0)
-            interval = max(0.1, self._get_num("tab_repeat", 400) / 1000.0)
-            holder = TabHolder(interval=interval)
-            holder.start()
-            self.log(f"[测试] 开始按住 Tab 6 秒（每 {int(interval * 1000)} 毫秒续按）… 看游戏里光标是否出现")
-            time.sleep(6)
-            holder.release()
-            self.log("[测试] 已松开 Tab")
-            self.after(300, self.deiconify)
-
-        threading.Thread(target=_hold, daemon=True).start()
-
     # ---------- 模板 / 坐标点操作 ----------
-    def on_mode_change(self):
-        coord = self.v_mode.get() == "coord"
-        self.lbl_tip.config(
-            text=(
-                "固定坐标模式：点「取点」→ 游戏自动切前台、鼠标被锁住、画面冻结，"
-                "把鼠标移到目标上点一下即可记录坐标；也可直接手填 X/Y。\n"
-                "冻结全程视角不会动；取完点如果提示「画面变化了」，说明视角动过，请重取一次。"
-                if coord else
-                "图像识别模式：点「录模板」→ 游戏画面冻结后拖框框住目标 → 松开保存，"
-                "运行时会实时搜索目标位置。模板从冻结帧裁剪，所见即所得。"
-            )
-        )
-        self.hint.config(
-            text=(
-                "建议顺序：① 硬币堆 ② MaxBet ③ 拉杆 ④ 按钮1/2/3（Bet 按钮只在押 1/2 枚时才需要）。\n"
-                "取完点点「测试」：鼠标会真的移到那个坐标上，看停没停在目标上。运行前确认游戏视角和取点时一致。"
-                if coord else
-                "框选技巧：只框按钮本体，别带太多背景；录完点「测试」在当前画面里找一遍（建议相似度 0.9 以上），"
-                "点「预览」放大看录进去的是什么。"
-            )
-        )
-        for key, _ in TEMPLATES:
-            self.tpl_status[key].config(
-                text=("待设定" if coord else "使用识图"),
-                foreground=(WARN if coord else ACCENT),
-            )
-        self._show_tpl_buttons()
-        self.refresh_tpl_status()
-        if hasattr(self, "btn_start"):
-            self._refresh_run_buttons()
-
     def _show_tpl_buttons(self):
         """定位表的操作按钮按模式显隐：坐标模式用「取点/测试」，
         识图模式用「录模板/测试/预览」。全部显示等于每行多两个没用的按钮。"""
@@ -3169,50 +2732,6 @@ class ModernApp(tk.Tk):
                 )
             ),
         )
-
-    def _freeze_then(self, build):
-        """取点/框选流程：锁鼠标 → 把游戏切到前台 → 等画面真正稳定 → 抓一帧冻结画面
-        → 用 build(frame) 创建浮层。
-
-        关键在于「锁鼠标」必须发生在「切前台」之前：切前台那一刻游戏就拿到
-        鼠标了，如果先切前台再想办法抢鼠标，中间那段空窗里手一动视角就转了，
-        浮层里的冻结画面和之后的实际画面对不上，取到的坐标当场作废。
-        现在整段空窗期光标都被钉住，游戏收不到净位移，视角不会动。
-        """
-        v = self.vars.get("game_window")
-        kw = (v.get().strip() if v else "") or str(self.cfg.get("game_window", "") or "")
-        if self.screen is None:
-            try:
-                self.screen = Screen()
-            except Exception as e:  # noqa: BLE001
-                self.log(f"[取点] 截屏初始化失败：{type(e).__name__}: {e}")
-                self.screen = None
-        try:
-            # 注意 with 的范围必须把 build(frame) 也包进去：创建浮层要把整屏
-            # 帧编码成 PhotoImage，这一步本身要几百毫秒，放在锁外面等于又留了一段
-            # 「游戏在前台 + 鼠标自由」的空窗，取点照样会被视角转动带偏。
-            with MouseLock():
-                try:
-                    if kw:
-                        wins = list_windows(kw)
-                        if wins:
-                            activate_window(wins[0][0])
-                    # 等游戏完成光标回中、画面稳定后再冻结（真实稳定检测，慢机器自动多等）
-                    frame = wait_frames_stable(self.screen.grab) if self.screen else None
-                except Exception as e:  # noqa: BLE001
-                    self.log(f"[取点] 冻结画面失败，退回实时遮罩：{type(e).__name__}: {e}")
-                    frame = None
-                if frame is not None:
-                    self._frozen_view = (frame, self._screen_signature(frame))
-                self._pick_frame = frame
-                if frame is not None:
-                    self.log("[取点] 画面已冻结：整个过程鼠标被锁住，视角不会动；画面不对按 Esc 重来")
-                build(frame)
-        except Exception as e:  # noqa: BLE001
-            self.log(f"[取点] 浮层创建失败：{type(e).__name__}: {e}")
-            self._pick_frame = None
-            self._frozen_view = None
-            self.deiconify()
 
     @staticmethod
     def _screen_signature(frame):
@@ -3277,25 +2796,6 @@ class ModernApp(tk.Tk):
         self.log(f"已设定坐标：{TPL_LABEL[key]} = ({x}, {y})")
         self._refresh_run_buttons()
         self._warn_if_view_drifted()
-
-    def _warn_if_view_drifted(self):
-        """保存完坐标/模板后核对视角有没有明显转动。
-
-        **只提示、不拦截。** 这个判断在真实游戏里无法做到既灵敏又准：
-        VRChat 画面一直在动（渲染抖动、粒子、头显微晃），判轻了漏报、
-        判重了误报。之前两次误报就是不断调阈值调出来的——继续调参
-        只会再来第三次误报，而误报的警告比没有警告更糟：会让人习惯性
-        忽略所有提醒，真出问题时也不信了。
-
-        所以改成：明显转动（超过阈值很多）才提示一句，措辞说明这只是
-        提醒、让你自己确认，不要当成必须重做的命令。坐标是否真的失效，
-        由「运行前自检」和「移动测试」来给出确定答案。
-        """
-        ok, msg = self._check_view_drift()
-        if not ok:
-            self.log("[提醒] " + msg)
-            # 不弹窗打断：写进日志即可，需要时用户自己能核对
-        return ok
 
     # ---------- Credit 参考图（最可靠的"没币"判断）----------
     def credit_ref_quality(self):
@@ -3441,10 +2941,6 @@ class ModernApp(tk.Tk):
         self.update_credit_label()
         self.log("已清除 Credit 区域")
 
-    def test_credit_rect(self):
-        self.withdraw()
-        self.after(350, self._test_credit_rect)
-
     def _test_credit_rect(self):
         r = self.cfg.get("credit_rect")
         if not r:
@@ -3529,45 +3025,6 @@ class ModernApp(tk.Tk):
             return value, f'读出「{value}」→ 没币{suffix}'
         return value, f'读出「{value}」→ 还有币{suffix}'
 
-    def tick_credit_readout(self, force=False):
-        """周期性读一次 Credit 并刷新界面/监测窗口"""
-        try:
-            r = self.cfg.get("credit_rect")
-            busy = bool(self.engine and self.engine.is_alive())
-            if r and len(r) == 4 and not busy:
-                reader = self._reader()
-                crop = reader.grab_credit()
-                if crop is None:
-                    self.lbl_credit_live.config(text="—", foreground=MUTED)
-                    self.lbl_credit_live_info.config(text="抓不到画面", foreground=DANGER)
-                else:
-                    show, info = self._read_credit_display(reader)
-                    empty, einfo = reader.credit_is_empty(crop)
-                    if show == '?':
-                        color = WARN
-                    elif empty:
-                        color = OK
-                    else:
-                        color = ACCENT
-                    self.lbl_credit_live.config(text=show, foreground=color)
-                    detail = einfo if show != '?' else info
-                    self.lbl_credit_live_info.config(
-                        text=detail, foreground=MUTED if show != '?' else WARN
-                    )
-                    if getattr(self, "monitor", None) is not None:
-                        self.monitor.update_reading(
-                            crop, None if show == '?' else show, detail, suspect=show == '?'
-                        )
-            elif not r:
-                self.lbl_credit_live.config(text="—", foreground=MUTED)
-                self.lbl_credit_live_info.config(text="还没框选 Credit 区域", foreground=MUTED)
-            elif busy:
-                self.lbl_credit_live_info.config(text="运行中暂停预览", foreground=MUTED)
-        except Exception as e:  # noqa: BLE001
-            self.lbl_credit_live_info.config(text=f"读取异常：{e}", foreground=DANGER)
-        if not force:
-            self.after(400, self.tick_credit_readout)
-
     # ---------- 监测区域 ----------
     def update_watch_label(self):
         r = self.cfg.get("watch_rect")
@@ -3606,46 +3063,6 @@ class ModernApp(tk.Tk):
         self.save_cfg()
         self.update_watch_label()
         self.log("已清除监测区域")
-
-    def test_watch_rect(self):
-        r = self.cfg.get("watch_rect")
-        if not r:
-            messagebox.showinfo("提示", "先框选监测区域")
-            return
-        if self.screen is None:
-            self.screen = Screen()
-        self.iconify()
-
-        def _run():
-            time.sleep(0.5)
-            x, y, w, h = [int(v) for v in r]
-            a = self.screen.grab_rect(x, y, w, h)
-            time.sleep(1.5)
-            b = self.screen.grab_rect(x, y, w, h)
-            d = region_diff(a, b)
-            if d is None:
-                self.log('[监测区域] 未找到足够红色数字笔画，请重新框选 Credit 数字')
-                self._post(self.deiconify)
-                return
-            thr = float(self.cfg.get("region_diff_threshold", 3.0))
-            self.log(
-                f"[监测区域] 静止 1.5 秒的噪声差异 = {d:.2f}（判定阈值 {thr}）"
-                f" → {'噪声偏大，请把阈值调到 ' + format(d * 2.5, '.1f') if d >= thr else 'OK，阈值可用'}"
-            )
-            self.log("[监测区域] 判断标准：有币下注时数字会变，差异应明显大于上面的噪声值")
-            self.after(300, self.deiconify)
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    def auto_find_credit(self):
-        """扫描屏幕，把所有像"红色数字"的区域列出来让你挑（省得靠猜位置）"""
-        if self.engine and self.engine.is_alive():
-            messagebox.showwarning("提示", "请先停止运行再扫描")
-            return
-        if self.screen is None:
-            self.screen = Screen()
-        self.withdraw()
-        self.after(400, self._scan_credit)
 
     def _scan_credit(self):
         try:
@@ -3710,30 +3127,6 @@ class ModernApp(tk.Tk):
         bar.pack(pady=8)
         ttk.Button(bar, text="就用这个", command=use_it).pack(side="left", padx=6)
         ttk.Button(bar, text="取消", command=win.destroy).pack(side="left", padx=6)
-
-    def move_test(self, key):
-        x, y = self.pt_vars[key][0].get().strip(), self.pt_vars[key][1].get().strip()
-        if not (x and y):
-            messagebox.showinfo("提示", f"{TPL_LABEL[key]} 还没设定坐标")
-            return
-        try:
-            x, y = int(float(x)), int(float(y))
-        except ValueError:
-            messagebox.showwarning("提示", "坐标必须是数字")
-            return
-        if self.engine and self.engine.is_alive():
-            messagebox.showwarning("提示", "运行中不要做移动测试")
-            return
-        self.iconify()
-
-        def _move():
-            time.sleep(0.4)
-            if pdi:
-                pdi.moveTo(x, y)
-            self.log(f"[测试] 鼠标已移动到 {TPL_LABEL[key]} ({x}, {y})，看是否停在目标上")
-            self.after(300, self.deiconify)
-
-        threading.Thread(target=_move, daemon=True).start()
 
     def reload_tpl(self):
         self.load_templates()
@@ -3946,29 +3339,6 @@ class ModernApp(tk.Tk):
             return False
         self.log("[自检] 全部通过，可以开跑")
         return True
-
-    def run_preflight(self):
-        """手动跑一次自检（按钮入口）。"""
-        if self.engine and self.engine.is_alive():
-            messagebox.showinfo("提示", "正在运行，先停止再自检")
-            return
-        self.collect_cfg()
-        self.withdraw()
-
-        def _work():
-            try:
-                issues = self.preflight()
-            except Exception as e:  # noqa: BLE001
-                self.after(0, lambda: (self.deiconify(),
-                                       messagebox.showerror("自检失败", str(e))))
-                return
-            lines = []
-            for lvl, msg in issues:
-                mark = {"error": "✗", "warn": "!", "ok": "✓"}[lvl]
-                lines.append(f"{mark} {msg}")
-            self.after(0, lambda: self._finish_preflight("\n".join(lines), issues))
-
-        self.after(200, lambda: threading.Thread(target=_work, daemon=True).start())
 
     def _finish_preflight(self, text, issues):
         self.deiconify()
@@ -4196,12 +3566,6 @@ class ModernApp(tk.Tk):
             self.cfg["points"] = pts
         return self.cfg
 
-    def collect_and_save(self):
-        self.collect_cfg()
-        self.save_cfg()
-        if hasattr(self, "btn_start"):
-            self._refresh_run_buttons()
-
     # ---------- 配置方案（多机器档案） ----------
     def _profile_dir(self):
         d = os.path.join(DATA_DIR, "配置方案")
@@ -4228,29 +3592,6 @@ class ModernApp(tk.Tk):
                       else "还没有方案。先按当前机器调好，点「把当前配置存为方案…」。"))
         except tk.TclError:
             pass
-
-    def save_profile_as(self):
-        self.collect_cfg()
-        name = simpledialog.askstring(
-            "保存配置方案", "给这台机器/这套设置起个名字（例如：大厅1号机）：", parent=self)
-        if not name:
-            return
-        name = name.strip()
-        if not name:
-            return
-        path = os.path.join(self._profile_dir(), f"{name}.json")
-        if os.path.exists(path) and not messagebox.askyesno(
-                "覆盖确认", f"方案「{name}」已存在，覆盖它？", parent=self):
-            return
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.cfg, f, ensure_ascii=False, indent=2)
-        except Exception as e:  # noqa: BLE001
-            messagebox.showerror("保存失败", f"方案写入磁盘失败：{e}", parent=self)
-            return
-        self.log(f"[方案] 已保存当前配置为方案「{name}」")
-        self.refresh_profiles()
-        self.v_profile.set(name)
 
     def load_profile(self):
         name = self.v_profile.get()
@@ -4329,7 +3670,7 @@ class ModernApp(tk.Tk):
             return
         path = filedialog.asksaveasfilename(
             title="导出运行日志", defaultextension=".txt",
-            initialfile=time.strftime("LuraSlot日志_%Y%m%d_%H%M%S.txt"),
+            initialfile=time.strftime("SlotBot日志_%Y%m%d_%H%M%S.txt"),
             parent=self)
         if not path:
             return
@@ -4344,176 +3685,9 @@ class ModernApp(tk.Tk):
     def log(self, msg):
         self.logq.put(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
-    def pump_log(self):
-        """日志泵 + 界面状态机心跳（每 150ms 一拍）。
-
-        这一拍里必须完成「引擎退出 → 恢复开始/停止按钮」的交接：
-        曾经只有注释说"由 pump_log 在引擎结束后恢复"，实际没接——
-        点了停止、引擎确实停了，但界面永远卡在「运行中」、开始一直灰着。
-        另外任何一拍抛异常都会杀死 after 链（界面整个冻结，看起来也像
-        「停止没用」），所以整拍兜底，after 链永远续上。
-        """
-        try:
-            try:
-                self.txt.configure(state="normal")
-                while True:
-                    line = self.logq.get_nowait()
-                    self.txt.insert("end", line + "\n", log_level(line))
-                    lines_seen = int(self.txt.index("end-1c").split(".")[0])
-                    if lines_seen > 800:
-                        self.txt.delete("1.0", "201.0")
-                    self.txt.see("end")
-                self.txt.configure(state="disabled")
-            except queue.Empty:
-                pass
-            except tk.TclError:
-                pass
-            was_running = getattr(self, "_engine_was_running", False)
-            if self.engine and self.engine.is_alive():
-                self._engine_was_running = True
-                state = self.engine.state
-                done = self.engine.spins_done
-                if getattr(self, "_stopping", False):
-                    self.lbl_state.config(text="● 停止中…", foreground=WARN)
-                else:
-                    self.lbl_state.config(text=f"● 运行中 · {state}", foreground=OK)
-                self.lbl_header_hint.config(text=f"已抽 {done} 次")
-                if getattr(self, "lbl_stats", None) is not None:
-                    secs = max(0, int(time.time() - getattr(self.engine, "started_at",
-                                                            time.time())))
-                    mm, ss = divmod(secs, 60)
-                    self.lbl_stats.config(
-                        text=f"已运行 {mm:02d}:{ss:02d} · 抽奖 {done} 次 · "
-                             f"确认下注 {getattr(self.engine, 'bets_confirmed', 0)} 注 · "
-                             f"用币 {getattr(self.engine, 'coins_used', 0)} 枚 · "
-                             f"完成 {getattr(self.engine, 'rounds_done', 0)} 轮",
-                        foreground=INK)
-                if getattr(self, "overlay", None) is not None:
-                    self.overlay.tick(f"运行中 · {state} · 已抽 {done} 次")
-            elif self.engine is not None:
-                self.lbl_state.config(text="● 空闲", foreground=MUTED)
-                self.lbl_header_hint.config(text="已停止")
-                if was_running:
-                    self._engine_was_running = False
-                    self._stopping = False
-                    self._refresh_run_buttons()
-                # 引擎结束了（可能是急停触发的），把置顶按钮收掉、窗口恢复
-                if getattr(self, "overlay", None) is not None:
-                    self._close_overlay()
-        except Exception:  # noqa: BLE001
-            # 一拍出错不能杀死刷新循环：记下来，下一拍照常跑
-            try:
-                self.logq.put(f"[{time.strftime('%H:%M:%S')}] [内部] 界面刷新出了一"
-                              f"次错（已自动恢复）。{traceback.format_exc(limit=1)}")
-            except Exception:
-                pass
-        finally:
-            try:
-                self.after(150, self.pump_log)
-            except tk.TclError:
-                pass  # 应用已关闭，不用再排下一拍
-
-    def start(self):
-        if pdi is None:
-            messagebox.showerror("缺少依赖", "未安装 pydirectinput，请先运行 安装依赖.bat")
-            return
-        if self.engine and self.engine.is_alive():
-            return
-        if self.collector and self.collector.is_alive():
-            # 采集也在真实操作鼠标，两边同时跑会互相打偏
-            messagebox.showinfo("提示", "自动采集正在进行，请先点「停止采集」再运行")
-            return
-        need = ["coin", "maxbet", "lever", "btn1", "btn2", "btn3"]
-        if int(self._get_num("bet_count", 3)) < 3:
-            need.append("bet")
-        self.collect_and_save()
-        if int(self.cfg['bet_count']) not in (1,2,3) or not 0 < float(self.cfg['threshold']) <= 1:
-            messagebox.showwarning('参数错误', '下注枚数必须是 1、2 或 3，相似度阈值必须大于 0 且不超过 1。')
-            return
-        try:
-            negative=[k for k in ('coin_count','draw_count','burn_count','rounds',
-                'coin_delay','step_delay','move_delay','last_coin_wait','region_wait','max_minutes',
-                'tab_repeat','bet_retries','bet_confirm_timeout') if float(self.cfg[k]) < 0]
-        except (TypeError, ValueError):
-            messagebox.showwarning('参数错误', '次数和等待时间必须是数字。')
-            return
-        if negative:
-            messagebox.showwarning('参数错误', '次数和等待时间不能为负数。')
-            return
-        if self.cfg.get("locate_mode", "coord") == "coord":
-            pts = self.cfg.get("points") or {}
-            missing = [TPL_LABEL[k] for k in need if not pts.get(k)]
-            if missing:
-                messagebox.showwarning("坐标不全", "还没设定这些坐标点：\n" + "\n".join(missing))
-                return
-        else:
-            missing = [TPL_LABEL[k] for k in need if k not in self.tpls]
-            invalid = [TPL_LABEL[k] for k in need if k in self.tpls and
-                       (self.tpls[k].std()<4 or k not in self.cfg.get('template_rects', {}))]
-            if invalid:
-                messagebox.showwarning('请重新录制模板', '旧模板为空白或没有定位范围，请重新录制：\n'+'\n'.join(invalid))
-                return
-            if missing:
-                messagebox.showwarning("模板不全", "还缺少模板：\n" + "\n".join(missing))
-                return
-        if not (self.cfg.get('credit_rect') or self.cfg.get('watch_rect')):
-            messagebox.showwarning('缺少下注确认区域', '请框选 Credit 数字区域；每次下注都需要确认扣币后才会拉杆。')
-            return
-        if self.screen is None:
-            self.screen = Screen()
-        # 上面只检查了「填了没有」，这里再检查「填的对不对」：
-        # 坐标是否在屏幕内、Credit 是否读得出、模板是否还能找到。
-        # 不通过就开跑的话，表现为「点了没反应」，排查成本极高。
-        try:
-            issues = self.preflight()
-        except Exception as e:  # noqa: BLE001
-            issues = [("error", f"自检异常：{e}")]
-        if not self._show_preflight(issues):
-            return
-        self.engine = Engine(self.cfg, dict(self.tpls), self.log, self.screen,
-                             dict(self.tpl_variants))
-        self._stopping = False
-        self.engine.start()
-        self._refresh_run_buttons()
-        # 置顶急停按钮（窗口最小化也能点）
-        try:
-            self.overlay = StopOverlay(self, self.request_stop)
-        except Exception as e:  # noqa: BLE001
-            self.overlay = None
-            self.log(f"[警告] 置顶停止按钮创建失败：{e}")
-        self.after(900, self.withdraw)  # 用 withdraw 而不是 iconify：置顶急停按钮才不会被一起收走
         # 注意：不要在这里用 after() 把「开始运行」重新放开——
         # 引擎还在跑，那样会导致可以重复开跑。按钮状态统一交给
         # _refresh_run_buttons()，由 pump_log 在引擎结束后恢复。
-
-    def request_stop(self):
-        """急停入口（热键 / 置顶按钮 / 主界面按钮都走这里）。
-
-        运行和采集**两个都可能正在动鼠标**，必须都停——
-        曾经只停引擎：采集时按 F12 毫无反应，而采集又拽着鼠标、
-        向导窗口被全屏游戏挡住，用户就没有任何办法停下它。
-        """
-        stopped = False
-        if self.engine and self.engine.is_alive():
-            self.engine.request_stop()
-            self.log("已请求停止…")
-            stopped = True
-        if self.collector and self.collector.is_alive():
-            self.collector.stop_flag.set()
-            self.log("已请求停止采集…")
-            stopped = True
-        if not stopped:
-            self.log("当前没有正在运行的自动化")
-        if stopped:
-            # 即时反馈：引擎收尾最多一两秒，这期间必须让用户知道按有效了
-            self._stopping = True
-            try:
-                self.lbl_ready.config(text="正在停止…（等引擎收尾，最多一两秒）",
-                                      foreground=WARN)
-            except (tk.TclError, AttributeError):
-                pass
-        self.after(200, self.deiconify)
-        self.after(300, self._close_overlay)
 
     def _close_overlay(self):
         if getattr(self, "overlay", None) is not None:
@@ -4524,26 +3698,6 @@ class ModernApp(tk.Tk):
             self.overlay = None
         self.deiconify()
         self.lift()
-
-    def on_close(self):
-        if self.engine and self.engine.is_alive():
-            self.engine.request_stop()
-            time.sleep(0.3)
-        if self.collector and self.collector.is_alive():
-            self.collector.stop_flag.set()
-            time.sleep(0.2)
-        if kb is not None:
-            try:
-                kb.clear_all_hotkeys()
-            except Exception:
-                pass
-        for callback in self.tk.call('after', 'info'):
-            try:
-                self.after_cancel(callback)
-            except tk.TclError:
-                pass
-        self.destroy()
-
 
 from runtime_controls import EngineFeatures, KeepAwake
 from original_features import AppFeatures, CollectorFeatures, pending_sample
@@ -4561,10 +3715,6 @@ class AutoCollector(CollectorFeatures, LegacyAutoCollector):
 class App(AppFeatures, ModernApp):
     core = sys.modules[__name__]
 
-def auto_collect_credit(crop, value, cfg=None, log=None):
-    pending_sample(sys.modules[__name__], crop, value, cfg, log)
-    return None  # A predicted value must not immediately train its own recognizer.
-
 def diag():
     """诊断 DPI 与截图链路：截图坐标错位会让所有点击打偏，必须能自查。"""
     import ctypes as _ct
@@ -4577,7 +3727,7 @@ def diag():
 
     awareness = DPI_AWARENESS
     names = {0: "unaware", 1: "system", 2: "per-monitor", 3: "per-monitor-v2"}
-    print(f"LuraSlot v{APP_VERSION}  作者：{APP_AUTHORS}")
+    print(f"SlotBot v{APP_VERSION}  作者：{APP_AUTHORS}")
     print("DPI aware          :", DPI_AWARE,
           "(awareness=%s)" % names.get(awareness, awareness))
     print("GetSystemMetrics   :", user32.GetSystemMetrics(0), "x", user32.GetSystemMetrics(1))

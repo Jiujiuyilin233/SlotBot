@@ -37,8 +37,16 @@ class AppFeatures(OriginalUI):
         self._wrappers = []
         self._stop_hook_removers = []
         self._stop_hook_down = set()
+        # 只读 Credit 的引擎缓存：配置/屏幕没变就复用，避免每拍重建线程级资源。
+        self._cached_credit_reader = None
+        self._credit_reader_sig = None
+        # 界面状态缓存：内容没变就不 configure 控件，Tk 才不会空转重绘。
+        self._last_state_text = None
+        self._last_stats_text = None
+        self._last_start_state = None
+        self._last_stop_state = None
+        self._last_schedule_text = None
         super().__init__()
-        self.title('SlotBot 原版界面 · 1005 功能整合')
         self._background(self.core.get_digit_bank, lambda value, error: None)
         self.after(40, self._pump_callbacks)
 
@@ -51,10 +59,19 @@ class AppFeatures(OriginalUI):
         return '部件模板：' + '　'.join(f'{label} {len(self.tpl_variants.get(key, []))}'
                                      for key, label in self.core.TEMPLATES)
 
+    def _set_state(self, text):
+        """统一的状态行写入：内容没变就不动控件。"""
+        if text != self._last_state_text:
+            self.lbl_state.configure(text=text)
+            self._last_state_text = text
+
     def _fit_window(self):
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f'{min(940, sw - 40)}x{min(820, sh - 70)}')
-        self.minsize(min(860, sw - 40), min(700, sh - 70))
+        w = min(980, max(680, sw - 40))
+        h = min(700, max(520, sh - 70))
+        self._fit_size = (w, h)
+        self.geometry(f'{w}x{h}')
+        self.minsize(min(820, sw - 40), min(540, sh - 70))
 
     def _post(self, fn, *args):
         if not self._closed:
@@ -119,18 +136,40 @@ class AppFeatures(OriginalUI):
     def _refresh_run_buttons(self):
         if not hasattr(self, 'btn_start'):
             return
-        self.btn_start.configure(state='disabled' if self.busy() else 'normal')
-        self.btn_stop.configure(state='normal' if self.busy() or getattr(self, '_action_window', None) else 'disabled')
+        start_state = 'disabled' if self.busy() else 'normal'
+        stop_state = 'normal' if self.busy() or getattr(self, '_action_window', None) else 'disabled'
+        # configure 即使值相同也会走一遍 Tk 状态机；每 150ms 调一次必须先比对。
+        if start_state != self._last_start_state:
+            self.btn_start.configure(state=start_state)
+            self._last_start_state = start_state
+        if stop_state != self._last_stop_state:
+            self.btn_stop.configure(state=stop_state)
+            self._last_stop_state = stop_state
+
+    def _credit_reader(self):
+        """取一个只用来读 Credit 的引擎实例（缓存：Credit 区域/参考图/屏幕没变就复用）。
+
+        每 400ms 新建 Engine+mss 会让挂机时的空转开销白白翻倍，这里只在
+        影响读数的配置变化时重建。Engine/Screen 本身可跨线程复用（mss 的
+        句柄在 Screen 内部按线程隔离）。
+        """
+        if self.screen is None:
+            self.screen = self.core.Screen()
+        rect = self.cfg.get('credit_rect')
+        sig = (tuple(rect) if rect else None, self.cfg.get('credit_ref'), id(self.screen))
+        if self._cached_credit_reader is None or sig != self._credit_reader_sig:
+            self._cached_credit_reader = self.core.Engine(copy.deepcopy(self.cfg), {}, lambda msg: None, self.screen)
+            self._credit_reader_sig = sig
+        return self._cached_credit_reader
 
     def tick_credit_readout(self, force=False):
         if self._closed:
             return
         rect = copy.deepcopy(self.cfg.get('credit_rect'))
         if rect and not self.busy() and not self._preview_busy:
-            cfg = copy.deepcopy(self.cfg)
             self._preview_busy = True
             def work():
-                reader = self.core.Engine(cfg, {}, lambda msg: None, self.screen or self.core.Screen())
+                reader = self._credit_reader()
                 crops = []
                 for _ in range(3):
                     crop = reader.grab_credit()
@@ -201,7 +240,11 @@ class AppFeatures(OriginalUI):
             return
         remaining = (self._schedule_wall - time.time() if self._schedule_wall is not None
                      else self._schedule_mono - time.monotonic())
-        self.lbl_state.configure(text=f'定时等待：{max(0, int(remaining))} 秒')
+        text = f'定时等待：{max(0, int(remaining))} 秒'
+        if text != self._last_schedule_text:
+            self.lbl_state.configure(text=text)
+            self._last_schedule_text = text
+            self._last_state_text = text
         if remaining <= 0:
             self._armed = False
             self._schedule_cancel.set()
@@ -219,7 +262,7 @@ class AppFeatures(OriginalUI):
         generation = self._generation
         self._operation_cancel = threading.Event()
         cancel = self._operation_cancel
-        self.lbl_state.configure(text='运行前自检…')
+        self._set_state('运行前自检…')
         self._refresh_run_buttons()
         self.withdraw()
         templates = dict(self.tpls)
@@ -250,19 +293,19 @@ class AppFeatures(OriginalUI):
             self._refresh_run_buttons()
             if error or result is None:
                 self.log('[自检失败] ' + str(error or '已取消'))
-                self.lbl_state.configure(text='自检失败，未启动')
+                self._set_state('自检失败，未启动')
                 return
             screen, issues, prepared_engine = result
             for level, text in issues:
                 self.log(f'[自检 {level}] {text}')
             errors = [text for level, text in issues if level == 'error']
             if errors:
-                self.lbl_state.configure(text='自检未通过')
+                self._set_state('自检未通过')
                 if not automatic:
                     messagebox.showwarning('自检未通过', '\n'.join(errors), parent=self)
                 return
             if check_only:
-                self.lbl_state.configure(text='自检通过')
+                self._set_state('自检通过')
                 return
             self.screen = screen
             self._cancel_completion = False
@@ -318,7 +361,7 @@ class AppFeatures(OriginalUI):
             self._mouse_lock = None
         self._cancel_action()
         self._stopping = True
-        self.lbl_state.configure(text='正在停止…')
+        self._set_state('正在停止…')
         self.deiconify()
         self._refresh_run_buttons()
 
@@ -326,28 +369,35 @@ class AppFeatures(OriginalUI):
         if self._closed:
             return
         try:
+            inserted = 0
             for _ in range(100):
                 try:
                     line = self.logq.get_nowait()
                 except queue.Empty:
                     break
                 self.txt.insert('end', line + '\n')
-            if int(self.txt.index('end-1c').split('.')[0]) > 1000:
-                self.txt.delete('1.0', '201.0')
-            self.txt.see('end')
+                inserted += 1
+            if inserted:
+                # 没新日志时不要 see('end')：那会强制 Text 整页重绘，是界面空转卡顿的大头。
+                if int(self.txt.index('end-1c').split('.')[0]) > 1000:
+                    self.txt.delete('1.0', '201.0')
+                self.txt.see('end')
             engine = self.engine
             if engine and engine.is_alive():
                 elapsed = int(max(0, time.time() - engine.started_at))
-                self.lbl_state.configure(text='停止中…' if self._stopping else engine.state)
-                self.lbl_stats.configure(text=f'{elapsed // 60:02d}:{elapsed % 60:02d} · '
-                    f'{engine.spins_done} 局 · {engine.rounds_done} 轮 · '
-                    f'投币事件 {engine.coins_used} 次 · 下注按钮 {engine.bets_sent} 次')
+                self._set_state('停止中…' if self._stopping else engine.state)
+                stats = f'{elapsed // 60:02d}:{elapsed % 60:02d} · ' \
+                    f'{engine.spins_done} 局 · {engine.rounds_done} 轮 · ' \
+                    f'投币事件 {engine.coins_used} 次 · 下注按钮 {engine.bets_sent} 次'
+                if stats != self._last_stats_text:
+                    self.lbl_stats.configure(text=stats)
+                    self._last_stats_text = stats
                 if getattr(self, 'overlay', None) is not None:
                     self.overlay.tick(engine.state)
             elif engine and self._completion_seen is not engine:
                 self._completion_seen = engine
                 self._close_overlay()
-                self.lbl_state.configure(text=engine.finish_reason or '已停止')
+                self._set_state(engine.finish_reason or '已停止')
                 if engine.completed_normally and not self._cancel_completion:
                     self._finish_action(engine.cfg)
             self._refresh_run_buttons()
