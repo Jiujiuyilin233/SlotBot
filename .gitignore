@@ -1,0 +1,33 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Generated builds
+/build/
+/dist/
+*.spec
+*.exe
+*.zip
+
+# Personal settings, calibration, screenshots and logs
+config.json
+config.*.json
+!config.example.json
+*.log
+ui-smoke*.json
+ui-smoke-error.txt
+验收结果.txt
+digits/
+待审核数字样本/
+配置方案/
+diagnostics/
+其他截图/
+
+# Desktop/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
