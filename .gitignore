@@ -32,3 +32,7 @@ tests/seven_screen_*.png
 Thumbs.db
 .idea/
 .vscode/
+
+# 探针/压测的运行结果（每次跑都变，不入库）
+crash_probe*_result.json
+robust_probe_result.json

@@ -440,6 +440,30 @@ class Interface(unittest.TestCase):
             jobs[0][1](None,None)
             self.assertTrue(a._operation_busy);self.assertIs(a._mouse_lock,newer);self.assertNotIn('overlay',timeline)
             a._operation_busy=False;a._mouse_lock=None
+    def test_variant_template_save_survives_chinese_dir(self):
+        """部件模板落盘必须走中文路径安全的 save_image（cv2.imwrite 在中文目录静默失败）。"""
+        import os, tempfile
+        img=inherited.np.full((20,30,3),120,inherited.np.uint8)
+        with tempfile.TemporaryDirectory(prefix='中文目录_') as tmp:
+            p=s._save_variant(tmp,'sample.png',img)
+            self.assertIsNotNone(p);self.assertTrue(os.path.exists(p))
+    def test_credit_reader_is_cached_until_config_changes(self):
+        """实时读数引擎要缓存复用：配置没变不重建，Credit 区域变了才重建。"""
+        a=self.a;a.cfg['credit_rect']=[10,10,80,40];a.cfg['credit_ref']=None
+        r1=a._credit_reader();r2=a._credit_reader()
+        self.assertIs(r1,r2)
+        a.cfg['credit_rect']=[20,20,80,40]
+        r3=a._credit_reader()
+        self.assertIsNot(r1,r3)
+        a._cached_credit_reader=None
+    def test_window_is_themed_and_compact(self):
+        """界面必须接入统一主题（clam），且窗口 ≤1000×720、内容超出处页内滚动。"""
+        a=self.a
+        self.assertEqual(a.tk.call('ttk::style','theme','use'),'clam')
+        w,h=a._fit_size
+        self.assertLessEqual(w,1000,f'窗口过宽：{w}')
+        self.assertLessEqual(h,720,f'窗口过高：{h}')
+        self.assertGreaterEqual(len(a._scroll_canvases),3,'三个页签都应是可滚动页面')
 
 SELECTED='''real_zero_not_11111 all_standard_digits real_hooked_seven full_real_screens_find_credit_and_chance
 dark_obstructed_and_red_button_are_unknown truncated_digit_never_reads_as_one digit_fit_accepts_real_selections
@@ -454,7 +478,8 @@ template_bank_never_misreads_real_samples stale_bank_is_served_without_blocking 
 red_button_boxes_splits_triple import_button_samples_whole_grouped_and_skip load_template_variants_merges_main_and_subdir
 locate_uses_all_variants_and_picks_best load_templates_pulls_main_and_variants truth_gate_stops_on_bad_readings
 next_sample_name_never_overwrites pick_credit_candidate_prefers_reading_over_distance rotate_plan_symmetric_and_dedup
-wizard_settle_accepts_fraction'''.split()
+wizard_settle_accepts_fraction
+wheel_scrolls_when_cursor_is_over_a_child window_is_compact'''.split()
 def main():
     suite=unittest.TestSuite()
     for cls in (Policies,EnginePolicy,RefillRecognition,Interface):suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(cls))

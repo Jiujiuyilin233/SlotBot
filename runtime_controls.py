@@ -299,6 +299,70 @@ class EngineFeatures:
     def credit_has_bet(self, credit):
         return credit == ENOUGH_CREDIT or (credit is not None and credit >= int(self.cfg['bet_count']))
 
+    def _scene_probe(self):
+        """Return a frame to judge whether the scene is still animating.
+
+        Prefer the Credit region: on a win payout the Credit number animates up,
+        so its motion is the most direct "the game is busy and ignoring clicks"
+        signal for the empty-spin bug. Fall back to the watch region (reel/scene
+        motion) when Credit isn't configured. Either is far more likely to be set
+        than neither. Returns None if no region is available.
+        """
+        cr = self.cfg.get('credit_rect')
+        if cr and len(cr) == 4 and self.screen is not None:
+            try:
+                x, y, w, h = [int(v) for v in cr]
+                if w >= 4 and h >= 4:
+                    return self.screen.grab_rect(x, y, w, h)
+            except Exception:
+                pass
+        region = self._watch_region()
+        if region is not None:
+            return region
+        return None
+
+    def wait_win_settled(self, default_wait=0.3, max_wait=1.5, quiet_frames=2,
+                         quiet_threshold=4.0, poll=0.05):
+        """After the last stop button, hold until the watched region stops
+        changing, so the next round's bet click isn't swallowed by the game's
+        post-win "input ignored" window (that caused empty spins).
+
+        Uses a *cheap pixel difference* on the small Credit (or watch) region
+        rather than heavy optical flow: a settled region reads ~0, an animating
+        win-payout digit reads large. This keeps the call fast even when invoked
+        on every spin (the old DIS-optical-flow version was slow enough to stall
+        the regression suite).
+
+        The region is normally static after a non-win spin, so this returns
+        after `default_wait`. After a real win the digit animates up and we hold
+        until it settles — bounded by `max_wait` so latency is never unbounded.
+        """
+        from slotbot import frame_diff
+        region = self._scene_probe()
+        if region is None:
+            # Nothing to watch: pay a fixed, bounded delay. We never add
+            # unbounded latency and we never under-wait badly for a no-win spin.
+            self.pause(default_wait)
+            return False
+        min_until = time.monotonic() + default_wait
+        deadline = time.monotonic() + max_wait
+        prev = region
+        quiet = 0
+        while time.monotonic() < deadline:
+            self.boundary()
+            cur = self._scene_probe()
+            if cur is not None:
+                diff = frame_diff(prev, cur)
+                if diff is not None and diff <= quiet_threshold:
+                    quiet += 1
+                else:
+                    quiet = 0
+                prev = cur
+            if time.monotonic() >= min_until and quiet >= quiet_frames:
+                return True
+            self.pause(poll)
+        return False
+
     def place_bet(self):
         bet = int(self.cfg['bet_count'])
         steps = [('maxbet', 3)] if bet == 3 else [('bet', 1)] * bet
@@ -336,6 +400,9 @@ class EngineFeatures:
             self.pause(float(self.cfg['step_delay']) / 1000)
             if not self.click_template(key):
                 return (False, True) if watch_change else False
+        # Let a win payout finish so the next round's bet click isn't swallowed
+        # by the "screen ignores input" window — that was causing empty spins.
+        self.wait_win_settled()
         self.spins_done += 1
         return (True, True) if watch_change else True
 

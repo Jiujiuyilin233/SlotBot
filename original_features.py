@@ -37,8 +37,39 @@ class AppFeatures(OriginalUI):
         self._wrappers = []
         self._stop_hook_removers = []
         self._stop_hook_down = set()
+        # 只读 Credit 的引擎缓存：配置/屏幕没变就复用，避免每拍重建线程级资源。
+        self._cached_credit_reader = None
+        self._credit_reader_sig = None
+        # 常驻解码线程 + 画面哈希缓存：实时读数是唯一的高频后台活，
+        # 每拍建线程/建 mss/重复解码都是白烧的 CPU（见 _decode_loop）。
+        self._decode_jobs = queue.Queue()
+        self._decode_thread = None
+        self._tick_cache = None
+        # 界面状态缓存：内容没变就不 configure 控件，Tk 才不会空转重绘。
+        self._last_state_text = None
+        self._last_stats_text = None
+        self._last_start_state = None
+        self._last_stop_state = None
+        self._last_schedule_text = None
+        # 状态横幅/侧栏徽章共用的配色档缓存，以及日志自动滚动开关
+        self._last_status_level = None
+        self._dot_lit = True
+        self._auto_scroll = True
+        # pump_log 每拍都会读 _stopping；不能等 _begin_start 才补上
+        self._stopping = False
+        # 常亮：空闲期独立的防息屏/防睡眠持有句柄（None=未开启）
+        self._awake_hold = None
+        # 开始/常亮热键的按下沿检测（GetAsyncKeyState 按住不放每拍都真，必须记沿）
+        self._hotkey_down = set()
         super().__init__()
-        self.title('SlotBot 原版界面 · 1005 功能整合')
+        # 上次开着「常亮」就自动恢复（cfg 在 super().__init__ 里已加载）
+        if self.cfg.get('keep_awake_idle'):
+            try:
+                hold = KeepAwake(True, log=self.log)
+                hold.__enter__()
+                self._awake_hold = hold
+            except Exception:
+                self._awake_hold = None
         self._background(self.core.get_digit_bank, lambda value, error: None)
         self.after(40, self._pump_callbacks)
 
@@ -51,10 +82,61 @@ class AppFeatures(OriginalUI):
         return '部件模板：' + '　'.join(f'{label} {len(self.tpl_variants.get(key, []))}'
                                      for key, label in self.core.TEMPLATES)
 
+    def _set_state(self, text, level=None):
+        """统一的状态行写入：内容没变就不动控件。
+
+        level 是显式配色档（idle/running/stopping/error），不给就按文案猜；
+        状态同时喂给运行页横幅和侧栏徽章，两处永远是同一数据源。
+        """
+        if text != self._last_state_text:
+            self.lbl_state.configure(text=text)
+            if getattr(self, 'badge_label', None) is not None:
+                self.badge_label.configure(text=text)
+            self._last_state_text = text
+            self._apply_status(level or self._status_level(text))
+
+    def _status_level(self, text):
+        """按文案归档状态色：空闲灰 / 运行绿 / 停止中琥珀 / 异常红。"""
+        t = str(text or '')
+        if any(k in t for k in ('失败', '未通过', '异常', '错误')):
+            return 'error'
+        if '停止中' in t or '正在停止' in t:
+            return 'stopping'
+        return 'idle'
+
+    def _apply_status(self, level):
+        """状态配色统一入口：运行页横幅的色条+圆点、侧栏徽章圆点一起变。"""
+        if level == self._last_status_level:
+            return
+        self._last_status_level = level
+        self._dot_lit = True
+        color = self.core.STATE_COLORS.get(level, self.core.STATE_COLORS['idle'])
+        strip = getattr(self, 'status_strip', None)
+        if strip is not None:
+            strip.configure(bg=color)
+        for dot in (getattr(self, 'status_dot', None), getattr(self, 'badge_dot', None)):
+            if dot is not None:
+                dot.itemconfigure('dot', fill=color)
+
+    def _pulse_status_dot(self):
+        """运行中圆点呼吸闪烁：借 pump_log 的节拍按时间翻转颜色，
+        不新增 after 循环（状态刷新本来就有 150ms 的拍子）。"""
+        lit = int(time.time() * 2) % 2 == 0
+        if lit == self._dot_lit:
+            return
+        self._dot_lit = lit
+        fill = self.core.RUN_GREEN if lit else self.core.DOT_DIM_GREEN
+        for dot in (getattr(self, 'status_dot', None), getattr(self, 'badge_dot', None)):
+            if dot is not None:
+                dot.itemconfigure('dot', fill=fill)
+
     def _fit_window(self):
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f'{min(940, sw - 40)}x{min(820, sh - 70)}')
-        self.minsize(min(860, sw - 40), min(700, sh - 70))
+        w = min(980, max(680, sw - 40))
+        h = min(700, max(520, sh - 70))
+        self._fit_size = (w, h)
+        self.geometry(f'{w}x{h}')
+        self.minsize(min(820, sw - 40), min(540, sh - 70))
 
     def _post(self, fn, *args):
         if not self._closed:
@@ -63,17 +145,104 @@ class AppFeatures(OriginalUI):
     def _pump_callbacks(self):
         if self._closed:
             return
-        for _ in range(30):
+        try:
+            for _ in range(30):
+                try:
+                    fn, args = self._callbacks.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    fn(*args)
+                except Exception as exc:
+                    self.log(f'[界面] 操作失败：{type(exc).__name__}: {exc}')
+            self._poll_hotkeys()
+            self._tick_schedule()
+        except Exception as exc:
+            # 周期泵绝不能因为某一拍抛错就停摆：热键/定时任一环节异常都只记日志，
+            # 下面 finally 仍会续上下一次 after(40)，否则整个界面定时器静默死掉。
+            self.log(f'[界面] 周期任务异常：{type(exc).__name__}: {exc}')
+        finally:
+            if not self._closed:
+                self.after(40, self._pump_callbacks)
+
+    def _poll_hotkeys(self):
+        """开始(F11) / 常亮(F10) 热键：在 Tk 线程按 40ms 轮询 GetAsyncKeyState。
+
+        不用 keyboard 全局钩子：钩子回调跑在库自己的线程上，start()/toggle
+        都要动 Tk 控件，必须回到主线程。只认「按下沿」，按住不放不会连发。
+        """
+        if self._closed:
+            return
+        try:
+            pressed = self.core.key_pressed
+            start_down = any(pressed(vk) for vk, _ in self.core.start_key_entries(self.cfg))
+            awake_down = any(pressed(vk) for vk, _ in self.core.awake_key_entries(self.cfg))
+        except Exception:
+            return
+        if start_down and 'start' not in self._hotkey_down:
+            self._hotkey_down.add('start')
             try:
-                fn, args = self._callbacks.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                fn(*args)
+                self.start()      # 内部有 busy/配置校验，按钮灰着时等于忽略
             except Exception as exc:
-                self.log(f'[界面] 操作失败：{type(exc).__name__}: {exc}')
-        self._tick_schedule()
-        self.after(40, self._pump_callbacks)
+                self.log(f'[热键] 开始失败：{type(exc).__name__}: {exc}')
+        elif not start_down:
+            self._hotkey_down.discard('start')
+        if awake_down and 'awake' not in self._hotkey_down:
+            self._hotkey_down.add('awake')
+            try:
+                self.toggle_keep_awake()
+            except Exception as exc:
+                self.log(f'[热键] 常亮切换失败：{type(exc).__name__}: {exc}')
+        elif not awake_down:
+            self._hotkey_down.discard('awake')
+
+    def toggle_keep_awake(self):
+        """切换「常亮」：空闲也保持屏幕不熄灭、系统不睡眠。
+
+        用 SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED)，
+        和运行期 keep_awake 是两件独立的事：本开关全程持有，运行期那个只包住引擎。
+        真正的「屏幕变暗」由 Windows 电源设置决定，程序只保证不熄灭/不睡眠。
+        """
+        if self._awake_hold is not None:
+            try:
+                self._awake_hold.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._awake_hold = None
+            self.cfg['keep_awake_idle'] = False
+            self.log('[常亮] 已关闭，恢复系统正常电源管理')
+        else:
+            try:
+                hold = KeepAwake(True, log=self.log)
+                hold.__enter__()
+            except Exception as exc:
+                self.log(f'[常亮] 开启失败：{exc}')
+                return
+            self._awake_hold = hold
+            self.cfg['keep_awake_idle'] = True
+            self.log('[常亮] 已开启：屏幕保持点亮、系统不自动睡眠')
+        try:
+            self.save_cfg()
+        except Exception:
+            pass
+        self._refresh_awake_ui()
+
+    def _refresh_awake_ui(self):
+        btn = getattr(self, 'btn_awake', None)
+        if btn is None:
+            return
+        on = self._awake_hold is not None
+        try:
+            keys = ' / '.join(name for _vk, name in self.core.awake_key_entries(self.cfg))
+        except Exception:
+            keys = ''
+        state = '开' if on else '关'
+        label = f'常亮 {state} ({keys})' if keys else f'常亮 {state}'
+        try:
+            if str(btn.cget('text')) != label:
+                btn.configure(text=label)
+        except Exception:
+            pass
 
     def _background(self, work, done):
         def run():
@@ -83,6 +252,39 @@ class AppFeatures(OriginalUI):
                 value, error = None, exc
             self._post(done, value, error)
         threading.Thread(target=run, daemon=True).start()
+
+    def _submit_decode(self, work, done):
+        """把高频解码任务交给常驻线程（实时读数专用；一次性任务仍走 _background）。
+
+        每 400ms 新建一个线程，线程里的 mss 句柄也得跟着重建（Screen 的
+        mss 按线程隔离）——常驻线程让 mss 只建一次，线程创建开销归零。
+        """
+        if self._decode_thread is None or not self._decode_thread.is_alive():
+            self._decode_thread = threading.Thread(
+                target=self._decode_loop, daemon=True, name='slotbot-decode')
+            self._decode_thread.start()
+        self._decode_jobs.put((work, done))
+
+    def _decode_loop(self):
+        try:
+            while not self._closed:
+                job = self._decode_jobs.get()
+                if job is None:
+                    break
+                work, done = job
+                try:
+                    value, error = work(), None
+                except Exception as exc:
+                    value, error = None, exc
+                self._post(done, value, error)
+        finally:
+            # 常驻线程退出也别漏下自己的 mss 句柄（一张全屏 DIB ≈ 16MB）。
+            screen = getattr(self, 'screen', None)
+            if screen is not None:
+                try:
+                    screen.release_thread()
+                except Exception:
+                    pass
 
     def busy(self):
         return bool(self._operation_busy or self._picker_active or self._armed or getattr(self, '_action_window', None) or
@@ -119,38 +321,71 @@ class AppFeatures(OriginalUI):
     def _refresh_run_buttons(self):
         if not hasattr(self, 'btn_start'):
             return
-        self.btn_start.configure(state='disabled' if self.busy() else 'normal')
-        self.btn_stop.configure(state='normal' if self.busy() or getattr(self, '_action_window', None) else 'disabled')
+        start_state = 'disabled' if self.busy() else 'normal'
+        stop_state = 'normal' if self.busy() or getattr(self, '_action_window', None) else 'disabled'
+        # configure 即使值相同也会走一遍 Tk 状态机；每 150ms 调一次必须先比对。
+        if start_state != self._last_start_state:
+            self.btn_start.configure(state=start_state)
+            self._last_start_state = start_state
+        if stop_state != self._last_stop_state:
+            self.btn_stop.configure(state=stop_state)
+            self._last_stop_state = stop_state
+
+    def _credit_reader(self):
+        """取一个只用来读 Credit 的引擎实例（缓存：Credit 区域/参考图/屏幕没变就复用）。
+
+        每 400ms 新建 Engine+mss 会让挂机时的空转开销白白翻倍，这里只在
+        影响读数的配置变化时重建。Engine/Screen 本身可跨线程复用（mss 的
+        句柄在 Screen 内部按线程隔离）。
+        """
+        if self.screen is None:
+            self.screen = self.core.Screen()
+        rect = self.cfg.get('credit_rect')
+        sig = (tuple(rect) if rect else None, self.cfg.get('credit_ref'), id(self.screen))
+        if self._cached_credit_reader is None or sig != self._credit_reader_sig:
+            self._cached_credit_reader = self.core.Engine(copy.deepcopy(self.cfg), {}, lambda msg: None, self.screen)
+            self._credit_reader_sig = sig
+        return self._cached_credit_reader
 
     def tick_credit_readout(self, force=False):
         if self._closed:
             return
         rect = copy.deepcopy(self.cfg.get('credit_rect'))
         if rect and not self.busy() and not self._preview_busy:
-            cfg = copy.deepcopy(self.cfg)
             self._preview_busy = True
             def work():
-                reader = self.core.Engine(cfg, {}, lambda msg: None, self.screen or self.core.Screen())
-                crops = []
-                for _ in range(3):
-                    crop = reader.grab_credit()
-                    if crop is None:
-                        return None, '?', '抓不到 Credit 画面'
-                    crops.append(crop)
+                reader = self._credit_reader()
+                crop = reader.grab_credit()
+                if crop is None:
+                    return None, '?', '抓不到 Credit 画面'
+                # 画面没变就复用上次读数：空闲时数码管是静止的，绝大多
+                # 数拍能整段跳过抓帧和解码——这是挂机占用的大头。
+                key = (hash(crop.tobytes()), id(self.core.get_digit_bank()))
+                cached = self._tick_cache
+                if cached is not None and cached[0] == key:
+                    return cached[1]
+                crops = [crop]
+                for _ in range(2):
                     time.sleep(.08)
+                    c = reader.grab_credit()
+                    if c is None:
+                        return None, '?', '抓不到 Credit 画面'
+                    crops.append(c)
                 ok, fit = self.core.digit_fit(crops[-1])
                 value, info, agree, total = self.core.decode_consensus(crops, bank=self.core.get_digit_bank())
                 if not ok:
                     value, info = '?', '选区截断：' + fit
                 elif value and str(value).isdigit() and int(value) in (0, 1, 2):
-                    ref_path = self.core.resolve_ref_path(cfg.get('credit_ref'))
+                    ref_path = self.core.resolve_ref_path(self.cfg.get('credit_ref'))
                     reference = self.core.load_image(ref_path) if ref_path else None
                     trusted = [decode_credit_candidate(c, self.core.get_digit_bank(), reference)[0] for c in crops]
                     if not all(v == int(value) for v in trusted):
                         info = '预览低币未通过补币复核，运行时继续按次数'
                     else:
                         info = '低币已通过完整性、模板和三帧复核'
-                return crops[-1], value or '?', info
+                result = (crops[-1], value or '?', info)
+                self._tick_cache = (key, result)
+                return result
             def done(result, error):
                 self._preview_busy = False
                 if self.busy() or self.cfg.get('credit_rect') != rect:
@@ -163,7 +398,7 @@ class AppFeatures(OriginalUI):
                 self.lbl_credit_live_info.configure(text=info[:65])
                 if getattr(self, 'monitor', None) is not None and crop is not None:
                     self.monitor.update_reading(crop, value, info, suspect=value == '?')
-            self._background(work, done)
+            self._submit_decode(work, done)
         if not force:
             self.after(400, self.tick_credit_readout)
 
@@ -201,7 +436,11 @@ class AppFeatures(OriginalUI):
             return
         remaining = (self._schedule_wall - time.time() if self._schedule_wall is not None
                      else self._schedule_mono - time.monotonic())
-        self.lbl_state.configure(text=f'定时等待：{max(0, int(remaining))} 秒')
+        text = f'定时等待：{max(0, int(remaining))} 秒'
+        if text != self._last_schedule_text:
+            self._last_schedule_text = text
+            # 定时等待用琥珀色：还没在跑，但也不是空闲
+            self._set_state(text, level='stopping')
         if remaining <= 0:
             self._armed = False
             self._schedule_cancel.set()
@@ -219,7 +458,7 @@ class AppFeatures(OriginalUI):
         generation = self._generation
         self._operation_cancel = threading.Event()
         cancel = self._operation_cancel
-        self.lbl_state.configure(text='运行前自检…')
+        self._set_state('运行前自检…', level='running')
         self._refresh_run_buttons()
         self.withdraw()
         templates = dict(self.tpls)
@@ -250,19 +489,19 @@ class AppFeatures(OriginalUI):
             self._refresh_run_buttons()
             if error or result is None:
                 self.log('[自检失败] ' + str(error or '已取消'))
-                self.lbl_state.configure(text='自检失败，未启动')
+                self._set_state('自检失败，未启动')
                 return
             screen, issues, prepared_engine = result
             for level, text in issues:
                 self.log(f'[自检 {level}] {text}')
             errors = [text for level, text in issues if level == 'error']
             if errors:
-                self.lbl_state.configure(text='自检未通过')
+                self._set_state('自检未通过')
                 if not automatic:
                     messagebox.showwarning('自检未通过', '\n'.join(errors), parent=self)
                 return
             if check_only:
-                self.lbl_state.configure(text='自检通过')
+                self._set_state('自检通过', level='running')
                 return
             self.screen = screen
             self._cancel_completion = False
@@ -318,7 +557,7 @@ class AppFeatures(OriginalUI):
             self._mouse_lock = None
         self._cancel_action()
         self._stopping = True
-        self.lbl_state.configure(text='正在停止…')
+        self._set_state('正在停止…')
         self.deiconify()
         self._refresh_run_buttons()
 
@@ -326,28 +565,46 @@ class AppFeatures(OriginalUI):
         if self._closed:
             return
         try:
+            inserted = 0
             for _ in range(100):
                 try:
                     line = self.logq.get_nowait()
                 except queue.Empty:
                     break
-                self.txt.insert('end', line + '\n')
-            if int(self.txt.index('end-1c').split('.')[0]) > 1000:
-                self.txt.delete('1.0', '201.0')
-            self.txt.see('end')
+                # 时间戳/[级别] 前缀按级别上色：错误红、警告琥珀，日志一眼分层
+                level = self.core.log_level(line)
+                if level in ('error', 'warn') and '] ' in line:
+                    head = line[:line.find('] ') + 2]
+                    self.txt.insert('end', head, level)
+                    self.txt.insert('end', line[len(head):] + '\n')
+                else:
+                    self.txt.insert('end', line + '\n')
+                inserted += 1
+            if inserted:
+                # 没新日志时不要 see('end')：那会强制 Text 整页重绘，是界面空转卡顿的大头。
+                if int(self.txt.index('end-1c').split('.')[0]) > 1000:
+                    self.txt.delete('1.0', '201.0')
+                if self._auto_scroll:
+                    self.txt.see('end')
             engine = self.engine
             if engine and engine.is_alive():
                 elapsed = int(max(0, time.time() - engine.started_at))
-                self.lbl_state.configure(text='停止中…' if self._stopping else engine.state)
-                self.lbl_stats.configure(text=f'{elapsed // 60:02d}:{elapsed % 60:02d} · '
-                    f'{engine.spins_done} 局 · {engine.rounds_done} 轮 · '
-                    f'投币事件 {engine.coins_used} 次 · 下注按钮 {engine.bets_sent} 次')
+                self._set_state('停止中…' if self._stopping else engine.state,
+                                level='stopping' if self._stopping else 'running')
+                stats = f'{elapsed // 60:02d}:{elapsed % 60:02d} · ' \
+                    f'{engine.spins_done} 局 · {engine.rounds_done} 轮 · ' \
+                    f'投币事件 {engine.coins_used} 次 · 下注按钮 {engine.bets_sent} 次'
+                if stats != self._last_stats_text:
+                    self.lbl_stats.configure(text=stats)
+                    self._last_stats_text = stats
+                if self._last_status_level == 'running':
+                    self._pulse_status_dot()
                 if getattr(self, 'overlay', None) is not None:
                     self.overlay.tick(engine.state)
             elif engine and self._completion_seen is not engine:
                 self._completion_seen = engine
                 self._close_overlay()
-                self.lbl_state.configure(text=engine.finish_reason or '已停止')
+                self._set_state(engine.finish_reason or '已停止')
                 if engine.completed_normally and not self._cancel_completion:
                     self._finish_action(engine.cfg)
             self._refresh_run_buttons()
@@ -383,10 +640,10 @@ class AppFeatures(OriginalUI):
         ttk.Button(win, text='取消关机', command=self._cancel_action).pack(pady=12)
         win.protocol('WM_DELETE_WINDOW', self._cancel_action)
         deadline = time.monotonic() + max(10, float(cfg.get('shutdown_countdown', 60)))
-        self._action_token = object()
-        token = self._action_token
+        self._action_sentinel = object()
+        sentinel = self._action_sentinel
         def tick():
-            if self._cancel_completion or self._action_token is not token:
+            if self._cancel_completion or self._action_sentinel is not sentinel:
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -400,7 +657,7 @@ class AppFeatures(OriginalUI):
         tick()
 
     def _cancel_action(self):
-        self._action_token = None
+        self._action_sentinel = None
         win = getattr(self, '_action_window', None)
         if win is not None:
             try:
@@ -450,6 +707,14 @@ class AppFeatures(OriginalUI):
         ttk.Label(win, text='急停键（逗号分隔；默认 F12,End）').grid(row=row, column=0, sticky='w', padx=12)
         ttk.Entry(win, textvariable=stop_keys, width=25).grid(row=row, column=1, padx=12)
         row += 1
+        start_keys = tk.StringVar(value=','.join(self.cfg.get('start_keys', ['F11'])))
+        ttk.Label(win, text='开始热键（逗号分隔；默认 F11）').grid(row=row, column=0, sticky='w', padx=12)
+        ttk.Entry(win, textvariable=start_keys, width=25).grid(row=row, column=1, padx=12)
+        row += 1
+        awake_keys = tk.StringVar(value=','.join(self.cfg.get('awake_keys', ['F10'])))
+        ttk.Label(win, text='常亮开关热键（默认 F10）').grid(row=row, column=0, sticky='w', padx=12)
+        ttk.Entry(win, textvariable=awake_keys, width=25).grid(row=row, column=1, padx=12)
+        row += 1
         ttk.Label(win, text='开始前检查操作位置；数字仅辅助补币。定时到达完成当前动作局后停止。\n'
                   '程序须保持打开、游戏可见且桌面解锁。金钱条件暂不启用。',
                   foreground='#666').grid(row=row, column=0, columnspan=2, padx=12, pady=10)
@@ -472,11 +737,20 @@ class AppFeatures(OriginalUI):
                 if not names or any(n.lower() not in known for n in names):
                     raise ValueError('急停键名称无效；建议 F12,End')
                 candidate['stop_keys'] = list(dict.fromkeys(known[n.lower()] for n in names))
+                for key, var, fallback, hint in (('start_keys', start_keys, 'F11', '开始'),
+                                                 ('awake_keys', awake_keys, 'F10', '常亮')):
+                    picked = [n.strip() for n in var.get().replace('，', ',').split(',') if n.strip()]
+                    if not picked:
+                        picked = [fallback]
+                    if any(n.lower() not in known for n in picked):
+                        raise ValueError(f'{hint}热键名称无效；建议 {fallback}')
+                    candidate[key] = list(dict.fromkeys(known[n.lower()] for n in picked))
                 validate_config(candidate)
                 self.cfg = candidate
                 self.save_cfg()
                 self._apply_cfg_to_ui()
                 self._bind_stop_hooks()
+                self._refresh_hotkey_labels()
                 win.destroy()
             except (ValueError, TypeError, OSError) as exc:
                 messagebox.showerror('设置错误', str(exc), parent=win)
@@ -564,6 +838,17 @@ class AppFeatures(OriginalUI):
             return
         self._background(lambda: self.core.get_digit_bank(force=True),
                          lambda value, error: self.log(f'[模板库] {error or self.core.bank_summary(value)}'))
+
+    def toggle_autoscroll(self):
+        """日志自动滚动开关：往回翻历史时关掉，新日志就不会把视图拽回底部。"""
+        self._auto_scroll = not self._auto_scroll
+        self.btn_autoscroll.configure(text='自动滚动 ✓' if self._auto_scroll else '自动滚动 ✗')
+        if self._auto_scroll:
+            self.txt.see('end')
+
+    def clear_log(self):
+        """只清界面上的日志文本，不影响日志队列和后续输出。"""
+        self.txt.delete('1.0', 'end')
 
     def collect_and_save(self):
         if not self.guard_settings():
@@ -746,17 +1031,23 @@ class AppFeatures(OriginalUI):
         self._mouse_lock = lock
         keyword = str(self.cfg.get('game_window') or '')
         def work():
-            wins = self.core.list_windows(keyword)
-            if keyword and not wins:
-                raise RuntimeError('找不到游戏窗口')
-            if wins:
-                self.core.activate_window(wins[0][0])
             screen = self.screen or self.core.Screen()
-            if cancel.is_set():
-                return None
-            frame = self.core.wait_frames_stable(screen.grab)
-            # Capture and scene comparison stay off the Tk thread.
-            return screen, frame, self._screen_signature(frame)
+            try:
+                wins = self.core.list_windows(keyword)
+                if keyword and not wins:
+                    raise RuntimeError('找不到游戏窗口')
+                if wins:
+                    self.core.activate_window(wins[0][0])
+                if cancel.is_set():
+                    return None
+                frame = self.core.wait_frames_stable(screen.grab)
+                # Capture and scene comparison stay off the Tk thread.
+                return screen, frame, self._screen_signature(frame)
+            finally:
+                # 一次性抓屏线程收工必须释放线程本地的 mss 句柄：
+                # 不释放则每个冻结截图线程漏 ~16MB（全屏 DIB+DC），
+                # 反复取点内存涨穿后进程直接死亡（v1.2.1 修的崩溃）。
+                screen.release_thread()
         def done(result, error):
             try:
                 if cancel.is_set() or generation != self._generation:
@@ -792,9 +1083,13 @@ class AppFeatures(OriginalUI):
         if not frozen or self.screen is None:
             return True
         def work():
-            now, _ = self._screen_signature(self.screen.grab())
-            shift = self.core.scene_shift(frozen[1][0], now)
-            return (shift or 0) * frozen[1][1]
+            try:
+                now, _ = self._screen_signature(self.screen.grab())
+                shift = self.core.scene_shift(frozen[1][0], now)
+                return (shift or 0) * frozen[1][1]
+            finally:
+                # 同上：一次性抓屏线程不释放 mss 句柄就是每轮 +16MB（v1.2.1 修的崩溃）。
+                self.screen.release_thread()
         self._background(work, lambda value, error: self.log(
             f'[校准提醒] 画面位移约 {value:.0f}px；若未转视角可忽略。')
             if not error and value > self.core.DRIFT_SHIFT_PX else None)
@@ -810,7 +1105,15 @@ class AppFeatures(OriginalUI):
                 self.after(80, finish)
                 return
             self._closed = True
+            self._decode_jobs.put(None)     # 唤醒常驻解码线程让它退出
             self._clear_stop_hooks()
+            # 常亮是进程持有的电源请求；不释放的话关掉程序后屏幕还一直亮着
+            if self._awake_hold is not None:
+                try:
+                    self._awake_hold.__exit__(None, None, None)
+                except Exception:
+                    pass
+                self._awake_hold = None
             self._close_overlay()
             for callback in self.tk.call('after', 'info'):
                 self.after_cancel(callback)

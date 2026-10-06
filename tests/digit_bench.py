@@ -192,6 +192,7 @@ def run(per_digit=40, seed=7, verbose=False):
     h, w, t, gap, inset = geo
     print(f"拟合几何: 高={h} 宽={w} 笔画={t} 中缝={gap} 内缩={inset}")
     rng = np.random.RandomState(seed)
+    np.random.seed(seed)   # jitter 里的噪声走了全局 np.random，必须一并固定，结果才可复现
     ok = wrong = unknown = 0
     per = {}
     for d in '0123456789':
