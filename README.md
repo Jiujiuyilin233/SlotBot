@@ -1,6 +1,6 @@
 # SlotBot
 
-Windows 下的 VRChat LuraSlot 桌面自动化辅助工具。保留「定位设置 / 参数设置 / 运行」三个标签页，卡片式排版、页内可滚动（带滚轮支持），整合 LuraSlot 1005 的识别与工具功能。
+Windows 下的 VRChat LuraSlot 桌面自动化辅助工具。左侧导航 + 「定位设置 / 参数设置 / 运行」三页卡片式布局（页内滚动、滚轮支持），整合 LuraSlot 1005 的识别与工具功能。
 
 ## 主要功能
 
@@ -67,10 +67,13 @@ py -3.11 -m venv .venv
 ```powershell
 .\.venv\Scripts\python.exe regression.py
 .\.venv\Scripts\python.exe tests\real_bench.py
+.\.venv\Scripts\python.exe tests\extreme_bench.py
 .\.venv\Scripts\python.exe run_slotbot.py --ui-smoke
 ```
 
-主回归覆盖未知数字继续抽奖、可靠低币保护、足够类别继续抽奖、快速投币、急停、定时和三标签页界面。回归测试隔离数据目录并模拟游戏输入、窗口激活和电源动作；`--ui-smoke` 只构建界面后退出，不发送游戏输入。
+主回归覆盖未知数字继续抽奖、可靠低币保护、足够类别继续抽奖、快速投币、急停、定时和界面契约。回归测试隔离数据目录并模拟游戏输入、窗口激活和电源动作；`--ui-smoke` 只构建界面后退出，不发送游戏输入。
+
+`tests\extreme_bench.py` 是**斜视角压力基准**：用七段数码管的伪 3D 渲染器（单应变换模拟转视角/倾斜 + 真机干扰链）在 175 个视角 × 0-9 上统计解码成绩，用来守住「站位偏了识别不崩」的底线。
 
 公开仓库仅包含数字和按钮裁剪图，排除完整游戏截图。主回归共 103 项，其中 5 项依赖可选的完整画面夹具，在公开包中标记为跳过，其余 98 项均应通过。私下提供 `tests/seven_screen_1.png` 至 `seven_screen_3.png` 可运行全景相关测试；它们已被 Git 忽略，不要公开上传。
 

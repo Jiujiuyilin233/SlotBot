@@ -103,6 +103,13 @@ OK = "#0f9d58"        # 通过 / 没币
 WARN = "#c47f0a"      # 提示 / 存疑
 DANGER = "#d93025"    # 错误 / 需要重做
 
+# 运行状态四档配色：空闲灰、运行绿、停止中琥珀、异常红。
+# 运行页状态横幅和侧栏全局徽章共用这一份数据源，两处颜色永远一致。
+RUN_GREEN = "#2e9e44"   # 运行中 / 已取点或已录模板
+AMBER = "#bb8800"       # 停止中 / 定时等待 / 尚未设定
+DOT_DIM_GREEN = "#b7e0bf"  # 运行圆点闪烁的暗态
+STATE_COLORS = {"idle": "#9aa4b2", "running": RUN_GREEN, "stopping": AMBER, "error": DANGER}
+
 # 视角漂移提醒阈值：画面整体位移超过这个**原图像素数**才提示。
 # 只用来「提个醒」，不拦截操作，所以宁可迟钝也不能误报——
 # 误报的提醒会让人忽略所有警告，真出事时反而不信。
@@ -285,7 +292,7 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 版本与署名：底栏、窗口标题、--diag、使用说明、README 都从这里取
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_AUTHORS = "Jiujiuyilin_233 / 绝世好裤裆"
 # 允许用环境变量指定数据目录（自检/测试时隔离，避免覆盖用户真实配置）
 DATA_DIR = os.environ.get("SLOTBOT_DATA_DIR") or APP_DIR
@@ -989,7 +996,7 @@ def setup_theme(root):
                     font=("Microsoft YaHei UI", 10, "bold"))
 
     style.configure("TButton", padding=(12, 6), relief="flat", background="#e8ecf1",
-                    foreground=INK, borderwidth=0)
+                    foreground=INK, borderwidth=0, width=-2)
     style.map("TButton",
               background=[("active", "#d8dee6"), ("pressed", "#c8d0da"), ("disabled", "#f0f2f5")],
               foreground=[("disabled", "#aab2bd")])
@@ -1001,9 +1008,27 @@ def setup_theme(root):
     style.configure("Danger.TButton", background=DANGER, foreground="#ffffff",
                     font=("Microsoft YaHei UI", 10, "bold"), padding=(16, 8))
     style.map("Danger.TButton",
-              background=[("active", "#b3271d"), ("pressed", "#96211a"), ("disabled", "#eaa9a4")])
+              background=[("active", "#b3271d"), ("pressed", "#96211a"), ("disabled", "#fdecea")],
+              foreground=[("disabled", "#d93025")])
     style.configure("Ghost.TButton", background=BG, foreground=ACCENT, padding=(10, 5))
     style.map("Ghost.TButton", background=[("active", "#e6edfd")], foreground=[("active", "#1d4fd8")])
+    # 标题行里的小号主色按钮（如参数页的「保存配置」）：Accent 的紧凑版
+    style.configure("AccentSmall.TButton", background=ACCENT, foreground="#ffffff",
+                    font=("Microsoft YaHei UI", 9, "bold"), padding=(10, 3))
+    style.map("AccentSmall.TButton",
+              background=[("active", "#1d4fd8"), ("pressed", "#1a45bd"), ("disabled", "#9db4e8")],
+              foreground=[("disabled", "#eef2fb")])
+    # 卡片标题行里的幽灵小按钮（日志工具条）：底色跟卡片白，不能露出页面灰底
+    style.configure("GhostSmall.TButton", background=CARD, foreground=ACCENT,
+                    padding=(8, 2), font=("Microsoft YaHei UI", 9))
+    style.map("GhostSmall.TButton",
+              background=[("active", "#e6edfd")], foreground=[("active", "#1d4fd8")])
+
+    # 页内滚动条弱化：细一点、融进底色，不跟内容抢注意力
+    style.configure("Vertical.TScrollbar", width=10, troughcolor=BG,
+                    background="#dfe4ea", borderwidth=0, arrowsize=12)
+    style.map("Vertical.TScrollbar",
+              background=[("active", "#c9d2dc"), ("pressed", "#b9c3cf")])
 
     style.configure("TEntry", fieldbackground="#ffffff", bordercolor=BORDER,
                     insertcolor=INK, padding=4)
@@ -1016,6 +1041,10 @@ def setup_theme(root):
     style.map("TCheckbutton", background=[("active", BG)],
               indicatorcolor=[("selected", ACCENT)])
     style.configure("TNotebook", background=BG, bordercolor=BORDER, borderwidth=1)
+    # 页签头整个不渲染：改用左侧导航切页。页签对象、nb.tabs() 与
+    # tab(t,'text') 契约原样保留（hidden 状态会把选中页的内容一起藏掉，
+    # 不能用 hidden，只摘掉 Tab 元素的渲染）。
+    style.layout("TNotebook.Tab", [])
     style.configure("TNotebook.Tab", padding=(20, 9), background="#e8ecf1",
                     foreground=MUTED, borderwidth=0)
     style.map("TNotebook.Tab",
@@ -2115,28 +2144,60 @@ class ModernApp(tk.Tk):
                 self.tpl_variants[key] = variants
 
     # ---------- 界面 ----------
-    def _card(self, parent, title=None, subtitle=None):
-        """白底卡片容器：所有功能块都放进卡片，视觉上分组而不是糊成一片。"""
+    def _card(self, parent, title=None, subtitle=None, action=None):
+        """白底卡片容器：所有功能块都放进卡片，视觉上分组而不是糊成一片。
+
+        标题左侧加 4px 蓝色竖条，让每张卡片的起点一眼可辨；
+        action 可选，放进标题行右侧（如参数页的「保存配置」小按钮）。
+        """
         outer = ttk.Frame(parent, style="Card.TFrame", padding=(16, 14, 16, 14))
-        body = ttk.Frame(outer, style="Card.TFrame")
+        head = None
+        if title or action is not None:
+            head = ttk.Frame(outer, style="Card.TFrame")
+            head.pack(fill="x")
+            strip = tk.Frame(head, width=4, bg=ACCENT)
+            strip.pack(side="left", fill="y", padx=(0, 8))
+        title_label = None
         if title:
-            ttk.Label(outer, text=title, style="Card.TLabel",
-                      font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+            title_label = ttk.Label(head, text=title, style="Card.TLabel",
+                                    font=("Microsoft YaHei UI", 11, "bold"))
+            title_label.pack(side="left")
+        if action is not None:
+            # action 的父级是页面本身，这里借 pack 的 in_ 把它摆进标题行右侧；
+            # 卡片 outer 比它晚创建、层级更高会把按钮盖住，必须 lift 一下
+            action.pack(in_=head, side="right")
+            action.lift()
         if subtitle:
             self._wrap(outer, subtitle, "CardMuted.TLabel").pack(
                 anchor="w", fill="x", pady=(4, 10))
+        body = ttk.Frame(outer, style="Card.TFrame")
         body.pack(fill="both", expand=True, pady=(8 if (title or subtitle) else 0, 0))
+        if title_label is not None:
+            # 标题标签挂在 body 上：可折叠卡要回头改标题文字（▸/▾）
+            body._title_label = title_label
         outer.pack(fill="x", padx=14, pady=(0, 12))
         return body
 
     def _wrap(self, parent, text, style="Muted.TLabel", width=None):
-        """带折行的说明文字：宽度跟随窗口，缩放/DPI 变化时不会排版错位。"""
+        """带折行的说明文字：宽度跟随父容器，缩放/DPI 变化时不会排版错位。
+
+        旧实现创建时读 winfo_width()——那时窗口还没映射、宽度恒为 1，
+        wraplength 被钉死在 360 且 _wrappers 从不重算。这里改成监听父容器
+        的 <Configure>：父容器每变一次宽度就按新宽度重算折行；
+        add="+" 是追加绑定，不覆盖别人已挂的事件。
+        """
         label = ttk.Label(parent, text=text, style=style, justify="left",
-                          wraplength=width or self._wrap_width())
+                          wraplength=width or 360)
+        if width is None:
+            parent.bind(
+                "<Configure>",
+                lambda e, l=label: l.configure(wraplength=max(240, e.width - 36)),
+                add="+")
         self._wrappers.append(label)
         return label
 
     def _wrap_width(self):
+        """初始折行宽度的兜底值；真实宽度由 _wrap 里的 <Configure> 动态接管。"""
         try:
             return max(360, self.winfo_width() - 96)
         except Exception:
@@ -2687,33 +2748,17 @@ class ModernApp(tk.Tk):
         self.log(f"[窗口] 激活「{wins[0][1]}」：{'成功' if ok else '失败，请手动点一下游戏'}")
 
     # ---------- 模板 / 坐标点操作 ----------
-    def _show_tpl_buttons(self):
-        """定位表的操作按钮按模式显隐：坐标模式用「取点/测试」，
-        识图模式用「录模板/测试/预览」。全部显示等于每行多两个没用的按钮。"""
-        coord = self.v_mode.get() == "coord"
-        show = ("pick", "test") if coord else ("record", "test", "preview")
-        for btns in getattr(self, "tpl_btns", {}).values():
-            for b in btns.values():
-                b.pack_forget()
-            for name in ("pick", "record", "test", "preview"):
-                if name in show:
-                    btns[name].pack(side="left", padx=(0, 4))
-
     def refresh_tpl_status(self):
         coord = self.v_mode.get() == "coord"
         for key, _ in TEMPLATES:
             if coord:
                 x, y = self.pt_vars[key][0].get().strip(), self.pt_vars[key][1].get().strip()
-                if x and y:
-                    self.tpl_status[key].config(text="已设定", foreground=OK)
-                else:
-                    self.tpl_status[key].config(text="未设定", foreground=DANGER)
+                ok = bool(x) and bool(y)
             else:
-                if key in self.tpls:
-                    h, w = self.tpls[key].shape[:2]
-                    self.tpl_status[key].config(text=f"已录制 {w}×{h}", foreground=OK)
-                else:
-                    self.tpl_status[key].config(text="未录制", foreground=DANGER)
+                ok = key in self.tpls
+            # 状态列只画一个圆点：绿=可用，琥珀=还没设好。表格里少一列字，
+            # 状态一眼可扫；具体细节由提示行和模板尺寸说明补充。
+            self.tpl_status[key].config(text="●", foreground=(RUN_GREEN if ok else AMBER))
 
     def pick_point(self, key):
         if self.engine and self.engine.is_alive():

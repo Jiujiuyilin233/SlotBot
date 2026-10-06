@@ -40,12 +40,23 @@ class AppFeatures(OriginalUI):
         # 只读 Credit 的引擎缓存：配置/屏幕没变就复用，避免每拍重建线程级资源。
         self._cached_credit_reader = None
         self._credit_reader_sig = None
+        # 常驻解码线程 + 画面哈希缓存：实时读数是唯一的高频后台活，
+        # 每拍建线程/建 mss/重复解码都是白烧的 CPU（见 _decode_loop）。
+        self._decode_jobs = queue.Queue()
+        self._decode_thread = None
+        self._tick_cache = None
         # 界面状态缓存：内容没变就不 configure 控件，Tk 才不会空转重绘。
         self._last_state_text = None
         self._last_stats_text = None
         self._last_start_state = None
         self._last_stop_state = None
         self._last_schedule_text = None
+        # 状态横幅/侧栏徽章共用的配色档缓存，以及日志自动滚动开关
+        self._last_status_level = None
+        self._dot_lit = True
+        self._auto_scroll = True
+        # pump_log 每拍都会读 _stopping；不能等 _begin_start 才补上
+        self._stopping = False
         super().__init__()
         self._background(self.core.get_digit_bank, lambda value, error: None)
         self.after(40, self._pump_callbacks)
@@ -59,11 +70,53 @@ class AppFeatures(OriginalUI):
         return '部件模板：' + '　'.join(f'{label} {len(self.tpl_variants.get(key, []))}'
                                      for key, label in self.core.TEMPLATES)
 
-    def _set_state(self, text):
-        """统一的状态行写入：内容没变就不动控件。"""
+    def _set_state(self, text, level=None):
+        """统一的状态行写入：内容没变就不动控件。
+
+        level 是显式配色档（idle/running/stopping/error），不给就按文案猜；
+        状态同时喂给运行页横幅和侧栏徽章，两处永远是同一数据源。
+        """
         if text != self._last_state_text:
             self.lbl_state.configure(text=text)
+            if getattr(self, 'badge_label', None) is not None:
+                self.badge_label.configure(text=text)
             self._last_state_text = text
+            self._apply_status(level or self._status_level(text))
+
+    def _status_level(self, text):
+        """按文案归档状态色：空闲灰 / 运行绿 / 停止中琥珀 / 异常红。"""
+        t = str(text or '')
+        if any(k in t for k in ('失败', '未通过', '异常', '错误')):
+            return 'error'
+        if '停止中' in t or '正在停止' in t:
+            return 'stopping'
+        return 'idle'
+
+    def _apply_status(self, level):
+        """状态配色统一入口：运行页横幅的色条+圆点、侧栏徽章圆点一起变。"""
+        if level == self._last_status_level:
+            return
+        self._last_status_level = level
+        self._dot_lit = True
+        color = self.core.STATE_COLORS.get(level, self.core.STATE_COLORS['idle'])
+        strip = getattr(self, 'status_strip', None)
+        if strip is not None:
+            strip.configure(bg=color)
+        for dot in (getattr(self, 'status_dot', None), getattr(self, 'badge_dot', None)):
+            if dot is not None:
+                dot.itemconfigure('dot', fill=color)
+
+    def _pulse_status_dot(self):
+        """运行中圆点呼吸闪烁：借 pump_log 的节拍按时间翻转颜色，
+        不新增 after 循环（状态刷新本来就有 150ms 的拍子）。"""
+        lit = int(time.time() * 2) % 2 == 0
+        if lit == self._dot_lit:
+            return
+        self._dot_lit = lit
+        fill = self.core.RUN_GREEN if lit else self.core.DOT_DIM_GREEN
+        for dot in (getattr(self, 'status_dot', None), getattr(self, 'badge_dot', None)):
+            if dot is not None:
+                dot.itemconfigure('dot', fill=fill)
 
     def _fit_window(self):
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
@@ -100,6 +153,30 @@ class AppFeatures(OriginalUI):
                 value, error = None, exc
             self._post(done, value, error)
         threading.Thread(target=run, daemon=True).start()
+
+    def _submit_decode(self, work, done):
+        """把高频解码任务交给常驻线程（实时读数专用；一次性任务仍走 _background）。
+
+        每 400ms 新建一个线程，线程里的 mss 句柄也得跟着重建（Screen 的
+        mss 按线程隔离）——常驻线程让 mss 只建一次，线程创建开销归零。
+        """
+        if self._decode_thread is None or not self._decode_thread.is_alive():
+            self._decode_thread = threading.Thread(
+                target=self._decode_loop, daemon=True, name='slotbot-decode')
+            self._decode_thread.start()
+        self._decode_jobs.put((work, done))
+
+    def _decode_loop(self):
+        while not self._closed:
+            job = self._decode_jobs.get()
+            if job is None:
+                break
+            work, done = job
+            try:
+                value, error = work(), None
+            except Exception as exc:
+                value, error = None, exc
+            self._post(done, value, error)
 
     def busy(self):
         return bool(self._operation_busy or self._picker_active or self._armed or getattr(self, '_action_window', None) or
@@ -170,26 +247,37 @@ class AppFeatures(OriginalUI):
             self._preview_busy = True
             def work():
                 reader = self._credit_reader()
-                crops = []
-                for _ in range(3):
-                    crop = reader.grab_credit()
-                    if crop is None:
-                        return None, '?', '抓不到 Credit 画面'
-                    crops.append(crop)
+                crop = reader.grab_credit()
+                if crop is None:
+                    return None, '?', '抓不到 Credit 画面'
+                # 画面没变就复用上次读数：空闲时数码管是静止的，绝大多
+                # 数拍能整段跳过抓帧和解码——这是挂机占用的大头。
+                key = (hash(crop.tobytes()), id(self.core.get_digit_bank()))
+                cached = self._tick_cache
+                if cached is not None and cached[0] == key:
+                    return cached[1]
+                crops = [crop]
+                for _ in range(2):
                     time.sleep(.08)
+                    c = reader.grab_credit()
+                    if c is None:
+                        return None, '?', '抓不到 Credit 画面'
+                    crops.append(c)
                 ok, fit = self.core.digit_fit(crops[-1])
                 value, info, agree, total = self.core.decode_consensus(crops, bank=self.core.get_digit_bank())
                 if not ok:
                     value, info = '?', '选区截断：' + fit
                 elif value and str(value).isdigit() and int(value) in (0, 1, 2):
-                    ref_path = self.core.resolve_ref_path(cfg.get('credit_ref'))
+                    ref_path = self.core.resolve_ref_path(self.cfg.get('credit_ref'))
                     reference = self.core.load_image(ref_path) if ref_path else None
                     trusted = [decode_credit_candidate(c, self.core.get_digit_bank(), reference)[0] for c in crops]
                     if not all(v == int(value) for v in trusted):
                         info = '预览低币未通过补币复核，运行时继续按次数'
                     else:
                         info = '低币已通过完整性、模板和三帧复核'
-                return crops[-1], value or '?', info
+                result = (crops[-1], value or '?', info)
+                self._tick_cache = (key, result)
+                return result
             def done(result, error):
                 self._preview_busy = False
                 if self.busy() or self.cfg.get('credit_rect') != rect:
@@ -202,7 +290,7 @@ class AppFeatures(OriginalUI):
                 self.lbl_credit_live_info.configure(text=info[:65])
                 if getattr(self, 'monitor', None) is not None and crop is not None:
                     self.monitor.update_reading(crop, value, info, suspect=value == '?')
-            self._background(work, done)
+            self._submit_decode(work, done)
         if not force:
             self.after(400, self.tick_credit_readout)
 
@@ -242,9 +330,9 @@ class AppFeatures(OriginalUI):
                      else self._schedule_mono - time.monotonic())
         text = f'定时等待：{max(0, int(remaining))} 秒'
         if text != self._last_schedule_text:
-            self.lbl_state.configure(text=text)
             self._last_schedule_text = text
-            self._last_state_text = text
+            # 定时等待用琥珀色：还没在跑，但也不是空闲
+            self._set_state(text, level='stopping')
         if remaining <= 0:
             self._armed = False
             self._schedule_cancel.set()
@@ -262,7 +350,7 @@ class AppFeatures(OriginalUI):
         generation = self._generation
         self._operation_cancel = threading.Event()
         cancel = self._operation_cancel
-        self._set_state('运行前自检…')
+        self._set_state('运行前自检…', level='running')
         self._refresh_run_buttons()
         self.withdraw()
         templates = dict(self.tpls)
@@ -305,7 +393,7 @@ class AppFeatures(OriginalUI):
                     messagebox.showwarning('自检未通过', '\n'.join(errors), parent=self)
                 return
             if check_only:
-                self._set_state('自检通过')
+                self._set_state('自检通过', level='running')
                 return
             self.screen = screen
             self._cancel_completion = False
@@ -375,23 +463,34 @@ class AppFeatures(OriginalUI):
                     line = self.logq.get_nowait()
                 except queue.Empty:
                     break
-                self.txt.insert('end', line + '\n')
+                # 时间戳/[级别] 前缀按级别上色：错误红、警告琥珀，日志一眼分层
+                level = self.core.log_level(line)
+                if level in ('error', 'warn') and '] ' in line:
+                    head = line[:line.find('] ') + 2]
+                    self.txt.insert('end', head, level)
+                    self.txt.insert('end', line[len(head):] + '\n')
+                else:
+                    self.txt.insert('end', line + '\n')
                 inserted += 1
             if inserted:
                 # 没新日志时不要 see('end')：那会强制 Text 整页重绘，是界面空转卡顿的大头。
                 if int(self.txt.index('end-1c').split('.')[0]) > 1000:
                     self.txt.delete('1.0', '201.0')
-                self.txt.see('end')
+                if self._auto_scroll:
+                    self.txt.see('end')
             engine = self.engine
             if engine and engine.is_alive():
                 elapsed = int(max(0, time.time() - engine.started_at))
-                self._set_state('停止中…' if self._stopping else engine.state)
+                self._set_state('停止中…' if self._stopping else engine.state,
+                                level='stopping' if self._stopping else 'running')
                 stats = f'{elapsed // 60:02d}:{elapsed % 60:02d} · ' \
                     f'{engine.spins_done} 局 · {engine.rounds_done} 轮 · ' \
                     f'投币事件 {engine.coins_used} 次 · 下注按钮 {engine.bets_sent} 次'
                 if stats != self._last_stats_text:
                     self.lbl_stats.configure(text=stats)
                     self._last_stats_text = stats
+                if self._last_status_level == 'running':
+                    self._pulse_status_dot()
                 if getattr(self, 'overlay', None) is not None:
                     self.overlay.tick(engine.state)
             elif engine and self._completion_seen is not engine:
@@ -614,6 +713,17 @@ class AppFeatures(OriginalUI):
             return
         self._background(lambda: self.core.get_digit_bank(force=True),
                          lambda value, error: self.log(f'[模板库] {error or self.core.bank_summary(value)}'))
+
+    def toggle_autoscroll(self):
+        """日志自动滚动开关：往回翻历史时关掉，新日志就不会把视图拽回底部。"""
+        self._auto_scroll = not self._auto_scroll
+        self.btn_autoscroll.configure(text='自动滚动 ✓' if self._auto_scroll else '自动滚动 ✗')
+        if self._auto_scroll:
+            self.txt.see('end')
+
+    def clear_log(self):
+        """只清界面上的日志文本，不影响日志队列和后续输出。"""
+        self.txt.delete('1.0', 'end')
 
     def collect_and_save(self):
         if not self.guard_settings():
@@ -860,6 +970,7 @@ class AppFeatures(OriginalUI):
                 self.after(80, finish)
                 return
             self._closed = True
+            self._decode_jobs.put(None)     # 唤醒常驻解码线程让它退出
             self._clear_stop_hooks()
             self._close_overlay()
             for callback in self.tk.call('after', 'info'):

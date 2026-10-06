@@ -57,7 +57,8 @@ def split_segments(vals, ratio=.5, min_peak=.30):
 def _digit_parts(img, led_min=65, color_diff=25):
     """把一张数码管图切成每位数字的掩码（左→右），并给出参考字高。
 
-    返回 (mask, parts, ref_h, height)；parts 是 [(列起, 列止, 该位掩码), ...]。
+    返回 (mask, parts, cores, ref_h, height)；parts 是 [(列起, 列止, 该位掩码), ...]，
+    cores 是与 parts 对齐的「亮核」掩码（更高红色阈值提取，可为 None）。
     返回 None 表示这张图里没有可切的数字块。
     """
     m = clean_mask(img, led_min, color_diff)
@@ -68,6 +69,9 @@ def _digit_parts(img, led_min=65, color_diff=25):
     height = y1-y0
     if height < 12:
         return None
+    # 亮核：更高阈值下的笔画。泛光（bloom）会把整体掩码吹宽 1.5~2 倍，
+    # 但真正发光的笔画核心依旧窄——它是分辨「胖 1」和真宽字的锚点。
+    core_m = clean_mask(img, int(led_min*1.55)+15, int(color_diff*1.5)+10)
     # Keep every segment, including disconnected horizontal bars. Split only truly empty columns.
     cols = np.where(m[y0:y1].any(axis=0))[0]
     groups = np.split(cols, np.where(np.diff(cols) > max(2, round(height*.04)))[0]+1)
@@ -98,6 +102,7 @@ def _digit_parts(img, led_min=65, color_diff=25):
 
     # 先按各自行范围切出每个组，再统一决定参考字高。
     parts = []
+    cores = []
     for group in groups:
         g0, g1 = int(group[0]), int(group[-1])+1
         # 每个数字按**自己的行范围**取样，不能用整体行范围：混合高度时
@@ -107,13 +112,21 @@ def _digit_parts(img, led_min=65, color_diff=25):
         rows = np.where(sub.any(axis=1))[0]
         d = sub[int(rows.min()):int(rows.max())+1]
         parts.append((g0, g1, d))
+        # 亮核掩码：同一列范围里用更高阈值重提，再按核心自己的行范围裁。
+        core = None
+        if core_m.any():
+            csub = core_m[y0:y1, g0:g1]
+            crows = np.where(csub.any(axis=1))[0]
+            if len(crows) and csub.sum() >= 8:
+                core = csub[int(crows.min()):int(crows.max())+1]
+        cores.append(core)
     # 参考字高：同一面板上的数字高度一致，取「宽高比像数字」的组里最高的。
     # 装饰残片（实测：右缘被切进的红色装饰只有 13~19px 高，真数字 55px+）
     # 会污染整体行范围，所以不能直接用 height 当字高。
     wide_hs = [d.shape[0] for _, _, d in parts
                if .30 <= d.shape[1] / max(1, d.shape[0]) <= 1.05]
     ref_h = max(wide_hs) if wide_hs else max(d.shape[0] for _, _, d in parts)
-    return m, parts, ref_h, height
+    return m, parts, cores, ref_h, height
 
 
 def decode_led_number(img, led_min=65, color_diff=25, seg_min=.18, **kw):
@@ -126,7 +139,7 @@ def decode_led_number(img, led_min=65, color_diff=25, seg_min=.18, **kw):
         if clean_mask(img, led_min, color_diff).sum() < 12:
             return '?', '没有足够的数字笔画；遮挡、熄屏或选区错误不能视为 0'
         return '?', '数字太小或只有局部笔画'
-    m, parts, ref_h, height = got
+    m, parts, cores, ref_h, height = got
     values, patterns = [], []
     for g0, g1, d in parts:
         h, w = d.shape
@@ -143,10 +156,40 @@ def decode_led_number(img, led_min=65, color_diff=25, seg_min=.18, **kw):
             # 竖向截断的真数字高度接近全高，不会掉进这条「跳过」分支，
             # 仍会在下面被拒绝——绝不能把 99 切掉一位后读成 9。
             continue
+        # 泛光把「1」吹胖的救赎：整体掩码宽了，但高阈值下提取的**亮核**
+        # 依旧是带腰身的窄双笔画。宽体（w/h < .55）且亮核窄（< .30、不到
+        # 整体宽的 3/4）时按亮核判 1，否则下面按宽体走段码采样会把
+        # 泛光灌进中间段窗、读成 9 之类的鬼数字。
+        core = None
+        for ci, (pg0, pg1, pd) in enumerate(parts):
+            if pg0 == g0 and pg1 == g1 and pd is d:
+                core = cores[ci]
+                break
+        if core is not None and core.size:
+            ch_, cw_ = core.shape
+            cr = core.mean(axis=1)
+            cwaist = cr[int(ch_*.4):int(ch_*.6)].min() if ch_ >= 8 else 1.0
+            if (.05 <= cw_/max(1, ch_) <= .30 and ch_ >= ref_h*.45
+                    and cw_ < w*.72 and core.mean() < .94 and cwaist < .85):
+                values.append('1'); patterns.append('1(亮核)'); continue
         # 门限放宽：真实「8」的填充率就有 0.71，加上发光很容易超过旧上限
         # 0.75 —— 旧门限把 8 判成「非数字红色块」，实测 40 张里 39 张读不出。
         if not .22 <= w/h <= 1.05 or not .05 < d.mean() < .94:
             return '?', '存在非数字红色块或选区包含无关物体'
+        # 轻度歪斜先转正再采样：±5° 的旋转会让固定分数采样窗错位，
+        # 采样出 0001001 这类无对应字形的乱段码。角度小(<2°)不动，
+        # 大角度交给 decode_led_best 的整体 deskew。
+        pts = cv2.findNonZero(d.astype(np.uint8))
+        if pts is not None:
+            (_cx, _cy), _sz, ang = cv2.minAreaRect(pts)
+            if ang > 45:
+                ang -= 90
+            if ang < -45:
+                ang += 90
+            if 2 <= abs(ang) <= 15:
+                M = cv2.getRotationMatrix2D((w/2.0, h/2.0), float(ang), 1.0)
+                d = cv2.warpAffine(d, M, (w, h), flags=cv2.INTER_NEAREST,
+                                   borderValue=0)
         def seg(fy0,fy1,fx0,fx1):
             z=d[int(fy0*h):max(int(fy0*h)+1,int(fy1*h)),
                 int(fx0*w):max(int(fx0*w)+1,int(fx1*w))]
@@ -375,31 +418,139 @@ def deskew_led(img):
     return fixed, float(ang)
 
 
-def decode_led_best(img, **kw):
-    """运行时统一入口：依次尝试 直接 → 转正 → 背板 → 背板+转正。
+def _quad_from_mask(m):
+    """从掩码凸包拟合四角（文档扫描的标准做法）。
 
-    每一步都只在「读不出」时才继续尝试；任何一步读出了就用它。
-    全部失败时返回第一步的失败原因——宁可读不出，绝不把读不出当 0。
+    对角极值点法对噪声过于敏感——一个离群像素就能把一个角带偏十几像素。
+    这里用 approxPolyDP 逐级放宽把凸包化简成四边形，取不到才退回极值点。
     """
-    val, info = decode_led_number(img, **kw)
-    if val is not None and '?' not in str(val):
-        return val, info
-    first_val, first_info = val, info
+    pts = cv2.findNonZero(m.astype(np.uint8))
+    if pts is None:
+        return None
+    hull = cv2.convexHull(pts)
+    quad = None
+    for frac in (.02, .035, .05, .08):
+        ap = cv2.approxPolyDP(hull, frac * cv2.arcLength(hull, True), True)
+        if len(ap) == 4:
+            quad = ap.reshape(4, 2).astype(np.float32)
+            break
+    if quad is None:
+        s = hull.reshape(-1, 2).astype(np.float32)
+        tl = s[np.argmin(s[:, 0] + s[:, 1])]
+        br = s[np.argmax(s[:, 0] + s[:, 1])]
+        tr = s[np.argmax(s[:, 0] - s[:, 1])]
+        bl = s[np.argmin(s[:, 0] - s[:, 1])]
+        quad = np.array([tl, tr, br, bl], np.float32)
+    # 顶点排序：tl/tr/br/bl
+    ssum = quad.sum(axis=1)
+    sdiff = quad[:, 0] - quad[:, 1]
+    tl, br = quad[np.argmin(ssum)], quad[np.argmax(ssum)]
+    tr, bl = quad[np.argmax(sdiff)], quad[np.argmin(sdiff)]
+    return np.array([tl, tr, br, bl], np.float32)
+
+
+def perspective_rectify(img):
+    """把斜视角（梯形投影）的数字面板拉回正视（**实验性，默认链未启用**）。
+
+    A/B 实测（tests/extreme_bench.py，1750 张合成极端视角样本）：接入默认链
+    读对 +0.4% 但**读错 +0.9%**——四角拟合在泛光/噪声下偶发偏移，矫正出
+    自信的错读，违背「读错是红线」原则，故只保留函数不进链。后续若改用
+    更稳的四角估计（如直线交点法）可重测接入。
+    deskew_led 只能转正 roll（画面内旋转）；转视角带来的是 yaw/pitch 的
+    **透视投影**——数字变成梯形、段码采样窗错位。LED 面板是平面，转视角
+    在成像上就是单应变换，可逆：拟合掩码的四角，单应拉回矩形。
+
+    返回 (矫正图, 是否发生了矫正)。四边形不成立（太碎、太扁）时返回原图。
+    """
+    if img is None or img.size == 0:
+        return img, False
+    m = clean_mask(img)
+    if m.sum() < 30:
+        return img, False
+    quad = _quad_from_mask(m)
+    if quad is None:
+        return img, False
+    tl, tr, br, bl = quad
+
+    def _dist(a, b):
+        return float(np.hypot(*(a - b)))
+
+    W = max(_dist(tr, tl), _dist(br, bl))
+    H = max(_dist(tl, bl), _dist(tr, br))
+    if W < 14 or H < 14 or not .30 <= W / max(1.0, H) <= 12.0:
+        return img, False                       # 碎块或比例不像数字串
+    # 四边形已经接近矩形时，单应≈恒等，没必要动
+    diag = float(np.hypot(W, H))
+    drift = max(abs(_dist(tl, tr) - _dist(bl, br)), abs(_dist(tl, bl) - _dist(tr, br)))
+    if drift < .05 * diag and _quad_skew(quad) < 5.0:
+        return img, False
+    dst = np.array([[0, 0], [W - 1, 0], [W - 1, H - 1], [0, H - 1]], np.float32)
+    M = cv2.getPerspectiveTransform(quad, dst)
+    out = cv2.warpPerspective(img, M, (int(W), int(H)),
+                              flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT,
+                              borderValue=(20, 16, 14))
+    return out, True
+
+
+def _quad_skew(quad):
+    """四边形的歪斜程度（度）：对边方向角的平均差。"""
+    tl, tr, br, bl = quad
+    import math
+    def ang(a, b):
+        return math.degrees(math.atan2(float(b[1] - a[1]), float(b[0] - a[0])))
+    top, bottom = ang(tl, tr), ang(bl, br)
+    left, right = ang(tl, bl), ang(tr, br)
+    return (abs(top - bottom) + abs(left - right)) / 2.0
+
+
+def decode_led_best(img, **kw):
+    """运行时统一入口：几何检测先行，倾斜图像先转正再解码，直接解码殿后。
+
+    关键教训（合成极端视角基准 tests/extreme_bench.py 实测）：梯形投影下的
+    直接解码会「自信地读错」（8 读成 6、1 读成 9，极端视角读错率一度 15%），
+    旧链「第一个读出就返回」根本轮不到矫正步骤。所以先做几何检测——画面
+    带旋转就先转正；直接解码放到最后当救援。
+
+    每一步都只在「读不出」时才继续尝试。全部失败时返回第一个失败原因——
+    宁可读不出，绝不把读不出当 0。
+    """
+    first_val, first_info = None, '画面为空'
     fixed, ang = deskew_led(img)
-    if fixed is not img:
-        fval, finfo = decode_led_number(fixed, **kw)
-        if fval is not None and '?' not in str(fval):
-            return fval, f'{finfo}（画面斜 {ang:.0f}°，已转正）'
+    tilted = fixed is not img
+
+    def _try(im, tag):
+        nonlocal first_val, first_info
+        v, i = decode_led_number(im, **kw)
+        if v is not None and '?' not in str(v):
+            return v, f'{i}（{tag}）' if tag else i
+        if first_val is None:
+            first_val, first_info = v, i
+        return None, None
+
+    if not tilted:
+        v = _try(img, '')
+        if v[0] is not None:
+            return v
+    if tilted:
+        v = _try(fixed, f'画面斜 {ang:.0f}°，已转正')
+        if v[0] is not None:
+            return v
+        # 转正后仍读不出才回头试直接解码（倾斜图上它常给出自信的错读，
+        # 放最后当救援；上层还有模板交叉验证和三帧共识兜底）
+        v = _try(img, '')
+        if v[0] is not None:
+            return v
     panel = find_led_panel(img)
     if panel is not None and panel.shape != img.shape:
-        pval, pinfo = decode_led_number(panel, **kw)
-        if pval is not None and '?' not in str(pval):
-            return pval, f'{pinfo}（已自动收紧到数码管背板）'
+        v = _try(panel, '已自动收紧到数码管背板')
+        if v[0] is not None:
+            return v
         fixedp, pang = deskew_led(panel)
         if fixedp is not panel:
-            qval, qinfo = decode_led_number(fixedp, **kw)
-            if qval is not None and '?' not in str(qval):
-                return qval, f'{qinfo}（背板+转正 {pang:.0f}°）'
+            v = _try(fixedp, f'背板+转正 {pang:.0f}°')
+            if v[0] is not None:
+                return v
     return first_val, first_info
 
 
@@ -433,6 +584,9 @@ def build_template_bank(samples):
     只有「切出来的位数 == 真值位数」的样本才收录——位数对不上说明
     图里混进了装饰残片或被截断，那种图当模板会把别的数字带偏。
     samples 是 (真值, 图) 对；真值可以是多位（按位对齐收录）。
+    注：试过给每张掩码加平移/膨胀/腐蚀变体，留一法显示它们会挤占
+    「最佳 vs 次优」区分度（margin 门），成绩不升反降——模板库贵在
+    样本真而多，不在变体多。
     """
     bank = {}
     for truth, img in samples:
