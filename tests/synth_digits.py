@@ -142,13 +142,14 @@ def photometric(img, rng, bloom_k=(3, 7), bright=(0.75, 1.3), noise=(2, 8),
 
 
 def synth_one(text, geom, yaw=0.0, pitch=0.0, roll=0.0, rng=None, **pho_kw):
-    """渲染一张指定视角的数字串图片。"""
+    """渲染一张指定视角的数字串图片（支持多位，画布按整串实际尺寸）。"""
     h, w, t, gap, inset = geom
     mask, _spans = render_number_mask(text, h, w, t, gap, inset)
     # 先把掩码内缩一点再透视：极端角度下投影会把角点甩出画面，留出边距
+    mh, mw = mask.shape
     pad = max(6, round(h * .18))
-    canvas = np.zeros((h + 2 * pad, w + 2 * pad), np.uint8)
-    canvas[pad:pad + h, pad:pad + w] = mask
+    canvas = np.zeros((mh + 2 * pad, mw + 2 * pad), np.uint8)
+    canvas[pad:pad + mh, pad:pad + mw] = mask
     H = viewpoint_homo(yaw, pitch, roll, canvas.shape[1], canvas.shape[0])
     warped = cv2.warpPerspective(canvas, H, (canvas.shape[1], canvas.shape[0]),
                                  flags=cv2.INTER_LINEAR,

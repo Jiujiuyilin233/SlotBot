@@ -141,12 +141,16 @@ def decode_led_number(img, led_min=65, color_diff=25, seg_min=.18, **kw):
         return '?', '数字太小或只有局部笔画'
     m, parts, cores, ref_h, height = got
     values, patterns = [], []
-    for g0, g1, d in parts:
+    for idx, (g0, g1, d) in enumerate(parts):
         h, w = d.shape
+        core = cores[idx]
         if w/h < .30:
             # A 1 has two vertical segments with a waist, not an arbitrary solid rectangle.
+            # 泛光可能把腰身的缺口填平——亮核（高阈值）里腰身还在，优先量亮核。
             r = d.mean(axis=1)
-            waist = r[int(h*.4):int(h*.6)].min()
+            if core is not None and core.size and core.shape[0] >= 8:
+                r = core.mean(axis=1)
+            waist = r[int(len(r)*.4):int(len(r)*.6)].min()
             if (.05 <= w/h <= .30 and h >= ref_h*.45
                     and d.mean() < .94 and waist < .85):
                 values.append('1'); patterns.append('1'); continue
@@ -160,11 +164,6 @@ def decode_led_number(img, led_min=65, color_diff=25, seg_min=.18, **kw):
         # 依旧是带腰身的窄双笔画。宽体（w/h < .55）且亮核窄（< .30、不到
         # 整体宽的 3/4）时按亮核判 1，否则下面按宽体走段码采样会把
         # 泛光灌进中间段窗、读成 9 之类的鬼数字。
-        core = None
-        for ci, (pg0, pg1, pd) in enumerate(parts):
-            if pg0 == g0 and pg1 == g1 and pd is d:
-                core = cores[ci]
-                break
         if core is not None and core.size:
             ch_, cw_ = core.shape
             cr = core.mean(axis=1)
