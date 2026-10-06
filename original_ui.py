@@ -16,9 +16,51 @@ NAV_SELECTED_BG = "#e8effc"   # 选中项底色
 NAV_HOVER_BG = "#eef2fb"      # 悬停底色
 
 
+class WrapRow(tk.Frame):
+    """水平排布的子控件，宽度不够时自动换行（不裁切）。
+
+    子控件只管创建（master 指向本类），由 _reflow 统一用 grid 布局；
+    外部不要再自己 pack/grid 它们。窄内容区下按钮不再被右边切掉。
+    """
+
+    def __init__(self, master, padx=6, **kw):
+        super().__init__(master, **kw)
+        self._pad = padx
+        self._busy = False
+        self.bind("<Configure>", lambda _e: self._reflow())
+
+    def _reflow(self):
+        if self._busy:
+            return
+        kids = list(self.winfo_children())
+        if not kids:
+            return
+        try:
+            self._busy = True
+            self.update_idletasks()
+            avail = max(40, self.winfo_width())
+            rows = [[]]
+            x = 0
+            for c in kids:
+                w = c.winfo_reqwidth()
+                if x and x + w > avail:
+                    rows.append([])
+                    x = 0
+                rows[-1].append(c)
+                x += w + self._pad
+            for c in kids:
+                c.grid_forget()
+            for r, items in enumerate(rows):
+                for col, c in enumerate(items):
+                    c.grid(row=r, column=col, padx=(0, self._pad), sticky="w")
+        finally:
+            self._busy = False
+
+
 class OriginalUI:
     def build_ui(self):
         self._scroll_canvases = []
+        self._wrap_rows = []
         # 滚轮必须 bind_all：Tk 把滚轮事件发给光标下的子控件，子控件的
         # bindtags 里没有 canvas，只在 canvas 上绑等于收不到（实踩过的坑）。
         self.bind_all("<MouseWheel>", self._wheel, add="+")
@@ -51,8 +93,9 @@ class OriginalUI:
         tools.pack(fill="x", padx=14, pady=(10, 0))
         # 按钮排一行、说明另起一行：说明若和按钮同排，pack 的空腔会被
         # 按钮挤到只剩几十像素，文字直接被裁没（实测踩过）。
-        btnrow = ttk.Frame(tools)
+        btnrow = WrapRow(tools, padx=6, bg=self.core.BG)
         btnrow.pack(fill="x")
+        self._wrap_rows.append(btnrow)
         for label, command in (("样本与采集", self.open_sample_center),
                                ("运行前自检", self.run_preflight),
                                ("坐标诊断", self.show_coordinate_report),
@@ -60,7 +103,7 @@ class OriginalUI:
                                ("激活游戏窗口", self.activate_game),
                                ("测试按住 Tab（6 秒）", self.test_tab)):
             ttk.Button(btnrow, text=label, style="Ghost.TButton",
-                       command=command).pack(side="left", padx=(0, 6))
+                       command=command)
         # 提示以动词短语开头：Tk 对中文只在空格处折行，短引号开头会让
         # 首行只挂「测试按住」四个字，很难看
         self._wrap(tools, "先在游戏里站好再点「测试按住 Tab」，看光标会不会出来；"
@@ -131,15 +174,15 @@ class OriginalUI:
             "框住机器上红色的 Credit 数码管（就是那个显示 0 的红色数字），"
             "可靠读到低币（MaxBet 时为 0、1、2）会提前结束本轮并投币。"
             "低币须通过完整性、模板及连续三帧复核；看不清时继续设定的抽奖/空转流程，每局重新尝试识别。")
-        crow = ttk.Frame(body, style="Card.TFrame")
-        crow.pack(anchor="w")
-        ttk.Button(crow, text="框选 Credit 区域", command=self.pick_credit_rect).pack(side="left", padx=(0, 3))
-        ttk.Button(crow, text="自动找红色数字区", command=self.auto_find_credit).pack(side="left", padx=3)
-        ttk.Button(crow, text="读取测试", command=self.test_credit_rect).pack(side="left", padx=3)
-        ttk.Button(crow, text="实时监测窗口", command=self.open_credit_monitor).pack(side="left", padx=3)
-        ttk.Button(crow, text="清除", style="Ghost.TButton", command=self.clear_credit_rect).pack(side="left", padx=3)
+        crow = WrapRow(body, padx=3, bg=self.core.CARD)
+        crow.pack(anchor="w", fill="x")
+        self._wrap_rows.append(crow)
+        ttk.Button(crow, text="框选 Credit 区域", command=self.pick_credit_rect)
+        ttk.Button(crow, text="自动找红色数字区", command=self.auto_find_credit)
+        ttk.Button(crow, text="读取测试", command=self.test_credit_rect)
+        ttk.Button(crow, text="实时监测窗口", command=self.open_credit_monitor)
+        ttk.Button(crow, text="清除", style="Ghost.TButton", command=self.clear_credit_rect)
         self.lbl_credit = ttk.Label(crow, text="", style="Card.TLabel", foreground="#bb8800")
-        self.lbl_credit.pack(side="left", padx=8)
         self.update_credit_label()
 
         live = ttk.Frame(body, style="Card.TFrame")
@@ -300,14 +343,16 @@ class OriginalUI:
                                    font=("Microsoft YaHei UI", 14, "bold"))
         self.lbl_state.pack(side="left")
 
-        bar = ttk.Frame(body, style="Card.TFrame")
+        bar = WrapRow(body, padx=6, bg=self.core.CARD)
         bar.pack(fill="x", pady=(10, 0))
+        self._wrap_rows.append(bar)
         self.btn_start = ttk.Button(bar, text="开始运行", style="Accent.TButton", command=self.start)
-        self.btn_start.pack(side="left", padx=(0, 6))
         self.btn_stop = ttk.Button(bar, text="停止 (F12)", style="Danger.TButton", command=self.request_stop)
-        self.btn_stop.pack(side="left", padx=6)
+        self.btn_awake = ttk.Button(bar, text="常亮 关 (F10)", style="Ghost.TButton",
+                                    command=self.toggle_keep_awake)
         ttk.Button(bar, text="重新加载模板", style="Ghost.TButton",
-                   command=self.reload_tpl).pack(side="left", padx=6)
+                   command=self.reload_tpl)
+        self._refresh_hotkey_labels()
 
         self.lbl_stats = ttk.Label(body, text="还没有运行记录", style="CardMuted.TLabel")
         self.lbl_stats.pack(anchor="w", pady=(10, 0))
@@ -338,6 +383,41 @@ class OriginalUI:
         # hidden 状态会把选中页的内容一起藏掉，不能用；页签对象与
         # tab(t,'text') 契约原样保留。
         self._paint_nav()
+
+        # 首次布局后强制换行重排：确保按钮在窄内容区下换行而非被右边切掉。
+        self.after(80, self._reflow_wrap_rows)
+
+    def _reflow_wrap_rows(self):
+        for row in getattr(self, "_wrap_rows", ()):
+            try:
+                row._reflow()
+            except Exception:
+                pass
+
+    def _refresh_hotkey_labels(self):
+        """把开始/停止/常亮按钮上的热键提示同步成当前配置。"""
+        def names(fn):
+            try:
+                return ' / '.join(name for _vk, name in fn(self.cfg))
+            except Exception:
+                return ''
+        try:
+            start = names(self.core.start_key_entries)
+            stop = names(self.core.stop_key_entries)
+        except Exception:
+            return
+        for attr, base, keys in (('btn_start', '开始运行', start),
+                                 ('btn_stop', '停止', stop)):
+            btn = getattr(self, attr, None)
+            if btn is None:
+                continue
+            label = f'{base} ({keys})' if keys else base
+            try:
+                if str(btn.cget('text')) != label:
+                    btn.configure(text=label)
+            except Exception:
+                pass
+        self._refresh_awake_ui()
 
     # ---------- 左侧导航 ----------
     def _build_sidebar(self, bar):

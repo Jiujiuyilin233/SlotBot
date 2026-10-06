@@ -28,6 +28,16 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 import cv2
 import numpy as np
 
+# Cap OpenCV's internal thread pool. By default it spawns one worker per CPU
+# core (often 16-32 on modern machines); each worker carries stack + pipeline
+# scratch that adds up to tens of MB of steady-state memory and causes CPU
+# oversubscription during the small, frequent per-frame image ops we do. A small
+# fixed cap trims that without slowing the actual work.
+try:
+    cv2.setNumThreads(min(4, cv2.getNumThreads() or 4))
+except Exception:  # noqa: BLE001
+    pass
+
 # ---------------- DPI 感知：让 tk / 截图 / 鼠标统一用物理像素 ----------------
 # 打包成 exe 时由 SlotBot.manifest 声明 PerMonitorV2（更早、更可靠）；
 # 这里是为源码直接运行时的兜底，两者保持一致。
@@ -120,6 +130,9 @@ DRIFT_SHIFT_PX = 25.0
 # 默认不含 Pause。Windows 用 VK_PAUSE 表示"正在拖动窗口"，
 # 运行中点一下标题栏拖动窗口就会按下它，导致误停（用户实踩）。
 DEFAULT_STOP_KEYS = ("F12", "End")
+# 开始/常亮热键同样默认不含修饰键。F11 开始、F10 切换「常亮」。
+DEFAULT_START_KEYS = ("F11",)
+DEFAULT_AWAKE_KEYS = ("F10",)
 
 # 可自定义的停止热键：名字 -> 虚拟键码。故意不含 Ctrl / Alt / Shift，
 # 单按修饰键就急停太容易误触。
@@ -153,31 +166,48 @@ KB_NAME = {
 }
 
 
-def stop_key_entries(cfg):
-    """当前配置的停止热键 -> [(vk, 显示名), ...]。
-
-    配置里存的是名字列表（stop_keys）。老配置只有 extra_stop_key 时也能兼容。
-    """
-    raw = cfg.get("stop_keys")
-    names = []
-    if isinstance(raw, (list, tuple)):
-        names = [str(n) for n in raw]
-    elif isinstance(raw, str) and raw.strip():
-        names = [p.strip() for p in raw.split(",")]
-    else:
-        names = list(DEFAULT_STOP_KEYS)
-    extra = str(cfg.get("extra_stop_key", "") or "").strip()
-    if extra:
-        names.append(extra)
+def _key_entries(names, fallback):
+    """热键名字列表 -> [(vk, 显示名), ...]；去重、丢弃无法识别的名字，全空则回退默认。"""
     out, seen = [], set()
     for n in names:
-        n = n.strip()
+        n = str(n).strip()
         vk = VK_BY_NAME.get(n) or VK_BY_NAME.get(n.title()) or VK_BY_NAME.get(n.upper())
         if vk is None or vk in seen:
             continue
         seen.add(vk)
         out.append((vk, NAME_BY_VK[vk]))
-    return out or [(VK_BY_NAME[k], k) for k in DEFAULT_STOP_KEYS]
+    return out or [(VK_BY_NAME[k], k) for k in fallback]
+
+
+def _cfg_key_names(cfg, key, fallback):
+    raw = cfg.get(key)
+    if isinstance(raw, (list, tuple)):
+        return [str(n) for n in raw]
+    if isinstance(raw, str) and raw.strip():
+        return [p.strip() for p in raw.split(",")]
+    return list(fallback)
+
+
+def stop_key_entries(cfg):
+    """当前配置的停止热键 -> [(vk, 显示名), ...]。
+
+    配置里存的是名字列表（stop_keys）。老配置只有 extra_stop_key 时也能兼容。
+    """
+    names = _cfg_key_names(cfg, "stop_keys", DEFAULT_STOP_KEYS)
+    extra = str(cfg.get("extra_stop_key", "") or "").strip()
+    if extra:
+        names.append(extra)
+    return _key_entries(names, DEFAULT_STOP_KEYS)
+
+
+def start_key_entries(cfg):
+    """开始运行热键 -> [(vk, 显示名), ...]（默认 F11）。"""
+    return _key_entries(_cfg_key_names(cfg, "start_keys", DEFAULT_START_KEYS), DEFAULT_START_KEYS)
+
+
+def awake_key_entries(cfg):
+    """常亮开关热键 -> [(vk, 显示名), ...]（默认 F10）。"""
+    return _key_entries(_cfg_key_names(cfg, "awake_keys", DEFAULT_AWAKE_KEYS), DEFAULT_AWAKE_KEYS)
 
 
 def key_pressed(vk):
@@ -954,6 +984,9 @@ DEFAULT_CFG = {
     # "正在拖动窗口"，运行中点标题栏拖动就会误停。
     "stop_keys": ["F12", "End"],   # 自定义停止热键（名字列表）
     "extra_stop_key": "",          # 兼容旧配置：单个附加键
+    "start_keys": ["F11"],         # 开始运行热键（名字列表）
+    "awake_keys": ["F10"],         # 常亮开关热键（名字列表）
+    "keep_awake_idle": False,      # 常亮：空闲也保持亮屏/防睡眠（与运行期 keep_awake 独立）
     "force_quit_presses": 2,       # 连按几次热键直接结束进程
 }
 
@@ -1927,6 +1960,10 @@ class RegionPicker(tk.Toplevel, ScaledOverlay):
         overlay_take_over_mouse(self)
 
     def _on_destroy(self, event):
+        # Drop the full-screen frozen frame as soon as the picker closes so its
+        # backing PhotoImage (and the decoded PNG it holds) can be reclaimed
+        # promptly instead of lingering until the next GC sweep.
+        self._photo = None
         if event.widget is self and self.on_close:
             self.on_close()
 
@@ -2052,6 +2089,10 @@ class PointPicker(tk.Toplevel, ScaledOverlay):
         overlay_take_over_mouse(self)
 
     def _on_destroy(self, event):
+        # Drop the full-screen frozen frame as soon as the picker closes so its
+        # backing PhotoImage (and the decoded PNG it holds) can be reclaimed
+        # promptly instead of lingering until the next GC sweep.
+        self._photo = None
         if event.widget is self and self.on_close:
             self.on_close()
 

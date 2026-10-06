@@ -57,7 +57,19 @@ class AppFeatures(OriginalUI):
         self._auto_scroll = True
         # pump_log 每拍都会读 _stopping；不能等 _begin_start 才补上
         self._stopping = False
+        # 常亮：空闲期独立的防息屏/防睡眠持有句柄（None=未开启）
+        self._awake_hold = None
+        # 开始/常亮热键的按下沿检测（GetAsyncKeyState 按住不放每拍都真，必须记沿）
+        self._hotkey_down = set()
         super().__init__()
+        # 上次开着「常亮」就自动恢复（cfg 在 super().__init__ 里已加载）
+        if self.cfg.get('keep_awake_idle'):
+            try:
+                hold = KeepAwake(True, log=self.log)
+                hold.__enter__()
+                self._awake_hold = hold
+            except Exception:
+                self._awake_hold = None
         self._background(self.core.get_digit_bank, lambda value, error: None)
         self.after(40, self._pump_callbacks)
 
@@ -133,17 +145,104 @@ class AppFeatures(OriginalUI):
     def _pump_callbacks(self):
         if self._closed:
             return
-        for _ in range(30):
+        try:
+            for _ in range(30):
+                try:
+                    fn, args = self._callbacks.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    fn(*args)
+                except Exception as exc:
+                    self.log(f'[界面] 操作失败：{type(exc).__name__}: {exc}')
+            self._poll_hotkeys()
+            self._tick_schedule()
+        except Exception as exc:
+            # 周期泵绝不能因为某一拍抛错就停摆：热键/定时任一环节异常都只记日志，
+            # 下面 finally 仍会续上下一次 after(40)，否则整个界面定时器静默死掉。
+            self.log(f'[界面] 周期任务异常：{type(exc).__name__}: {exc}')
+        finally:
+            if not self._closed:
+                self.after(40, self._pump_callbacks)
+
+    def _poll_hotkeys(self):
+        """开始(F11) / 常亮(F10) 热键：在 Tk 线程按 40ms 轮询 GetAsyncKeyState。
+
+        不用 keyboard 全局钩子：钩子回调跑在库自己的线程上，start()/toggle
+        都要动 Tk 控件，必须回到主线程。只认「按下沿」，按住不放不会连发。
+        """
+        if self._closed:
+            return
+        try:
+            pressed = self.core.key_pressed
+            start_down = any(pressed(vk) for vk, _ in self.core.start_key_entries(self.cfg))
+            awake_down = any(pressed(vk) for vk, _ in self.core.awake_key_entries(self.cfg))
+        except Exception:
+            return
+        if start_down and 'start' not in self._hotkey_down:
+            self._hotkey_down.add('start')
             try:
-                fn, args = self._callbacks.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                fn(*args)
+                self.start()      # 内部有 busy/配置校验，按钮灰着时等于忽略
             except Exception as exc:
-                self.log(f'[界面] 操作失败：{type(exc).__name__}: {exc}')
-        self._tick_schedule()
-        self.after(40, self._pump_callbacks)
+                self.log(f'[热键] 开始失败：{type(exc).__name__}: {exc}')
+        elif not start_down:
+            self._hotkey_down.discard('start')
+        if awake_down and 'awake' not in self._hotkey_down:
+            self._hotkey_down.add('awake')
+            try:
+                self.toggle_keep_awake()
+            except Exception as exc:
+                self.log(f'[热键] 常亮切换失败：{type(exc).__name__}: {exc}')
+        elif not awake_down:
+            self._hotkey_down.discard('awake')
+
+    def toggle_keep_awake(self):
+        """切换「常亮」：空闲也保持屏幕不熄灭、系统不睡眠。
+
+        用 SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED)，
+        和运行期 keep_awake 是两件独立的事：本开关全程持有，运行期那个只包住引擎。
+        真正的「屏幕变暗」由 Windows 电源设置决定，程序只保证不熄灭/不睡眠。
+        """
+        if self._awake_hold is not None:
+            try:
+                self._awake_hold.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._awake_hold = None
+            self.cfg['keep_awake_idle'] = False
+            self.log('[常亮] 已关闭，恢复系统正常电源管理')
+        else:
+            try:
+                hold = KeepAwake(True, log=self.log)
+                hold.__enter__()
+            except Exception as exc:
+                self.log(f'[常亮] 开启失败：{exc}')
+                return
+            self._awake_hold = hold
+            self.cfg['keep_awake_idle'] = True
+            self.log('[常亮] 已开启：屏幕保持点亮、系统不自动睡眠')
+        try:
+            self.save_cfg()
+        except Exception:
+            pass
+        self._refresh_awake_ui()
+
+    def _refresh_awake_ui(self):
+        btn = getattr(self, 'btn_awake', None)
+        if btn is None:
+            return
+        on = self._awake_hold is not None
+        try:
+            keys = ' / '.join(name for _vk, name in self.core.awake_key_entries(self.cfg))
+        except Exception:
+            keys = ''
+        state = '开' if on else '关'
+        label = f'常亮 {state} ({keys})' if keys else f'常亮 {state}'
+        try:
+            if str(btn.cget('text')) != label:
+                btn.configure(text=label)
+        except Exception:
+            pass
 
     def _background(self, work, done):
         def run():
@@ -608,6 +707,14 @@ class AppFeatures(OriginalUI):
         ttk.Label(win, text='急停键（逗号分隔；默认 F12,End）').grid(row=row, column=0, sticky='w', padx=12)
         ttk.Entry(win, textvariable=stop_keys, width=25).grid(row=row, column=1, padx=12)
         row += 1
+        start_keys = tk.StringVar(value=','.join(self.cfg.get('start_keys', ['F11'])))
+        ttk.Label(win, text='开始热键（逗号分隔；默认 F11）').grid(row=row, column=0, sticky='w', padx=12)
+        ttk.Entry(win, textvariable=start_keys, width=25).grid(row=row, column=1, padx=12)
+        row += 1
+        awake_keys = tk.StringVar(value=','.join(self.cfg.get('awake_keys', ['F10'])))
+        ttk.Label(win, text='常亮开关热键（默认 F10）').grid(row=row, column=0, sticky='w', padx=12)
+        ttk.Entry(win, textvariable=awake_keys, width=25).grid(row=row, column=1, padx=12)
+        row += 1
         ttk.Label(win, text='开始前检查操作位置；数字仅辅助补币。定时到达完成当前动作局后停止。\n'
                   '程序须保持打开、游戏可见且桌面解锁。金钱条件暂不启用。',
                   foreground='#666').grid(row=row, column=0, columnspan=2, padx=12, pady=10)
@@ -630,11 +737,20 @@ class AppFeatures(OriginalUI):
                 if not names or any(n.lower() not in known for n in names):
                     raise ValueError('急停键名称无效；建议 F12,End')
                 candidate['stop_keys'] = list(dict.fromkeys(known[n.lower()] for n in names))
+                for key, var, fallback, hint in (('start_keys', start_keys, 'F11', '开始'),
+                                                 ('awake_keys', awake_keys, 'F10', '常亮')):
+                    picked = [n.strip() for n in var.get().replace('，', ',').split(',') if n.strip()]
+                    if not picked:
+                        picked = [fallback]
+                    if any(n.lower() not in known for n in picked):
+                        raise ValueError(f'{hint}热键名称无效；建议 {fallback}')
+                    candidate[key] = list(dict.fromkeys(known[n.lower()] for n in picked))
                 validate_config(candidate)
                 self.cfg = candidate
                 self.save_cfg()
                 self._apply_cfg_to_ui()
                 self._bind_stop_hooks()
+                self._refresh_hotkey_labels()
                 win.destroy()
             except (ValueError, TypeError, OSError) as exc:
                 messagebox.showerror('设置错误', str(exc), parent=win)
@@ -991,6 +1107,13 @@ class AppFeatures(OriginalUI):
             self._closed = True
             self._decode_jobs.put(None)     # 唤醒常驻解码线程让它退出
             self._clear_stop_hooks()
+            # 常亮是进程持有的电源请求；不释放的话关掉程序后屏幕还一直亮着
+            if self._awake_hold is not None:
+                try:
+                    self._awake_hold.__exit__(None, None, None)
+                except Exception:
+                    pass
+                self._awake_hold = None
             self._close_overlay()
             for callback in self.tk.call('after', 'info'):
                 self.after_cancel(callback)
