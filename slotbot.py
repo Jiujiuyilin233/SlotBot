@@ -292,7 +292,7 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 版本与署名：底栏、窗口标题、--diag、使用说明、README 都从这里取
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 APP_AUTHORS = "Jiujiuyilin_233 / 绝世好裤裆"
 # 允许用环境变量指定数据目录（自检/测试时隔离，避免覆盖用户真实配置）
 DATA_DIR = os.environ.get("SLOTBOT_DATA_DIR") or APP_DIR
@@ -1067,6 +1067,24 @@ def log_level(msg):
     return "info"
 
 class Screen:
+    """mss 包装：mss 句柄不能跨线程共享，所以每个线程第一次抓屏时新建一个实例。
+
+    ⚠ mss 实例（MSS）没有 __del__ 兑底，内部缓存一张全屏 DIB 位图
+    （2560×1600×4 ≈ 16MB）+ 屏幕 DC + 内存 DC。实例由哪个线程创建，
+    就只能由哪个线程安全释放；一次性线程（冻结截图、视角核对等）
+    死亡后这些原生资源不会被自动回收 —— 每个线程净漏 ~16MB。
+    固定坐标取点每轮跑 2 个一次性线程，用户反复取点就每轮 +32MB，
+    内存涨穿后进程直接死亡（表现为"取点时崩溃"，无 Python 栈）。
+
+    这里用"登记 + 懒清扫"兑底：所有线程本地实例登记在 _REGISTRY，
+    任何线程抓屏时顺手回收属主已死线程的实例；一次性线程收工时
+    调 release_thread() 立刻释放自己名下的实例，不等懒清扫。
+    """
+
+    # (属主线程, mss 实例) 列表；锁保护增删，查找只发生在本线程
+    _REGISTRY = []
+    _REGISTRY_LOCK = threading.Lock()
+
     def __init__(self):
         self._local = threading.local()
         self.mon = self.sct.monitors[1]  # 主屏
@@ -1078,8 +1096,46 @@ class Screen:
     def sct(self):
         # mss keeps Win32 handles in thread-local storage; never share its instance.
         if not hasattr(self._local, 'sct'):
-            self._local.sct = mss.mss()
+            self._sweep_dead_owners()
+            sct = mss.mss()
+            self._local.sct = sct
+            with Screen._REGISTRY_LOCK:
+                Screen._REGISTRY.append((threading.current_thread(), sct))
         return self._local.sct
+
+    @classmethod
+    def _sweep_dead_owners(cls):
+        """回收属主线程已死亡的 mss 实例（懒清扫：抓屏时顺手做）。"""
+        alive = []
+        with cls._REGISTRY_LOCK:
+            for owner, sct in cls._REGISTRY:
+                if owner is threading.current_thread() or owner.is_alive():
+                    alive.append((owner, sct))
+                    continue
+                try:
+                    sct.close()
+                except Exception:
+                    pass
+            cls._REGISTRY[:] = alive
+
+    def release_thread(self):
+        """立即释放当前线程名下的 mss 实例（一次性抓屏线程收工时调用）。
+
+        释放后本线程的 sct 会按需重建；长驻线程正常抓屏不受影响。
+        """
+        sct = getattr(self._local, 'sct', None)
+        try:
+            del self._local.sct
+        except AttributeError:
+            pass
+        if sct is not None:
+            try:
+                sct.close()
+            except Exception:
+                pass
+            with Screen._REGISTRY_LOCK:
+                Screen._REGISTRY[:] = [
+                    (o, s) for o, s in Screen._REGISTRY if s is not sct]
 
     def grab(self):
         raw = np.array(self.sct.grab(self.mon))

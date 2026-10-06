@@ -167,16 +167,25 @@ class AppFeatures(OriginalUI):
         self._decode_jobs.put((work, done))
 
     def _decode_loop(self):
-        while not self._closed:
-            job = self._decode_jobs.get()
-            if job is None:
-                break
-            work, done = job
-            try:
-                value, error = work(), None
-            except Exception as exc:
-                value, error = None, exc
-            self._post(done, value, error)
+        try:
+            while not self._closed:
+                job = self._decode_jobs.get()
+                if job is None:
+                    break
+                work, done = job
+                try:
+                    value, error = work(), None
+                except Exception as exc:
+                    value, error = None, exc
+                self._post(done, value, error)
+        finally:
+            # 常驻线程退出也别漏下自己的 mss 句柄（一张全屏 DIB ≈ 16MB）。
+            screen = getattr(self, 'screen', None)
+            if screen is not None:
+                try:
+                    screen.release_thread()
+                except Exception:
+                    pass
 
     def busy(self):
         return bool(self._operation_busy or self._picker_active or self._armed or getattr(self, '_action_window', None) or
@@ -532,10 +541,10 @@ class AppFeatures(OriginalUI):
         ttk.Button(win, text='取消关机', command=self._cancel_action).pack(pady=12)
         win.protocol('WM_DELETE_WINDOW', self._cancel_action)
         deadline = time.monotonic() + max(10, float(cfg.get('shutdown_countdown', 60)))
-        self._action_token = object()
-        token = self._action_token
+        self._action_sentinel = object()
+        sentinel = self._action_sentinel
         def tick():
-            if self._cancel_completion or self._action_token is not token:
+            if self._cancel_completion or self._action_sentinel is not sentinel:
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -549,7 +558,7 @@ class AppFeatures(OriginalUI):
         tick()
 
     def _cancel_action(self):
-        self._action_token = None
+        self._action_sentinel = None
         win = getattr(self, '_action_window', None)
         if win is not None:
             try:
@@ -906,17 +915,23 @@ class AppFeatures(OriginalUI):
         self._mouse_lock = lock
         keyword = str(self.cfg.get('game_window') or '')
         def work():
-            wins = self.core.list_windows(keyword)
-            if keyword and not wins:
-                raise RuntimeError('找不到游戏窗口')
-            if wins:
-                self.core.activate_window(wins[0][0])
             screen = self.screen or self.core.Screen()
-            if cancel.is_set():
-                return None
-            frame = self.core.wait_frames_stable(screen.grab)
-            # Capture and scene comparison stay off the Tk thread.
-            return screen, frame, self._screen_signature(frame)
+            try:
+                wins = self.core.list_windows(keyword)
+                if keyword and not wins:
+                    raise RuntimeError('找不到游戏窗口')
+                if wins:
+                    self.core.activate_window(wins[0][0])
+                if cancel.is_set():
+                    return None
+                frame = self.core.wait_frames_stable(screen.grab)
+                # Capture and scene comparison stay off the Tk thread.
+                return screen, frame, self._screen_signature(frame)
+            finally:
+                # 一次性抓屏线程收工必须释放线程本地的 mss 句柄：
+                # 不释放则每个冻结截图线程漏 ~16MB（全屏 DIB+DC），
+                # 反复取点内存涨穿后进程直接死亡（v1.2.1 修的崩溃）。
+                screen.release_thread()
         def done(result, error):
             try:
                 if cancel.is_set() or generation != self._generation:
@@ -952,9 +967,13 @@ class AppFeatures(OriginalUI):
         if not frozen or self.screen is None:
             return True
         def work():
-            now, _ = self._screen_signature(self.screen.grab())
-            shift = self.core.scene_shift(frozen[1][0], now)
-            return (shift or 0) * frozen[1][1]
+            try:
+                now, _ = self._screen_signature(self.screen.grab())
+                shift = self.core.scene_shift(frozen[1][0], now)
+                return (shift or 0) * frozen[1][1]
+            finally:
+                # 同上：一次性抓屏线程不释放 mss 句柄就是每轮 +16MB（v1.2.1 修的崩溃）。
+                self.screen.release_thread()
         self._background(work, lambda value, error: self.log(
             f'[校准提醒] 画面位移约 {value:.0f}px；若未转视角可忽略。')
             if not error and value > self.core.DRIFT_SHIFT_PX else None)
